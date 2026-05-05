@@ -8,3 +8,9 @@ aiohttp
 opencv-python
 numpy
 qrcode
+fastapi
+uvicorn
+python-multipart
+pydantic
+pytest
+httpx
