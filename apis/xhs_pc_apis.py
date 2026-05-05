@@ -767,6 +767,75 @@ class XHS_Apis():
             msg = _log_api_error(e)
         return success, msg, out_comment_list
 
+    def post_comment(
+        self,
+        note_id: str,
+        content: str,
+        cookies_str: str,
+        root_comment_id: str = "",
+        parent_comment_id: str = "",
+        at_users: list | None = None,
+        proxies: dict = None,
+    ):
+        """
+            创建评论或回复评论
+            :param note_id 笔记id
+            :param content 评论内容
+            :param root_comment_id 一级评论id，回复一级评论时传入
+            :param parent_comment_id 目标评论id，回复二级评论时传入
+        """
+        res_json = None
+        content = (content or "").strip()
+        if not note_id or not content:
+            return False, "note_id 或 content 不能为空", res_json
+        at_users = at_users or []
+        payload_candidates = [
+            {
+                "note_id": note_id,
+                "content": content,
+                "at_users": at_users,
+                "root_comment_id": root_comment_id,
+                "target_comment_id": parent_comment_id or root_comment_id,
+            },
+            {
+                "note_id": note_id,
+                "content": content,
+                "at_users": at_users,
+                "root_comment_id": root_comment_id,
+                "parent_comment_id": parent_comment_id or root_comment_id,
+            },
+            {
+                "note_id": note_id,
+                "content": content,
+                "at_users": at_users,
+                "root_comment_id": root_comment_id,
+                "comment_id": parent_comment_id or root_comment_id,
+            },
+        ]
+        api = "/api/sns/web/v1/comment/post"
+        last_msg = "评论发送失败"
+        try:
+            for payload in payload_candidates:
+                headers, cookies, data = generate_request_params(cookies_str, api, payload, 'POST')
+                response = requests.post(
+                    self.base_url + api,
+                    headers=headers,
+                    data=data.encode('utf-8'),
+                    cookies=cookies,
+                    proxies=proxies,
+                    timeout=REQUEST_TIMEOUT,
+                )
+                res_json = response.json()
+                success = bool(res_json.get("success"))
+                msg = res_json.get("msg", "")
+                if success:
+                    return success, msg, res_json
+                last_msg = msg or last_msg
+        except Exception as e:
+            success = False
+            last_msg = _log_api_error(e)
+        return False, last_msg, res_json
+
     def get_unread_message(self, cookies_str: str, proxies: dict = None):
         """
             获取未读消息
@@ -1022,7 +1091,6 @@ if __name__ == '__main__':
     note_url = r'https://www.xiaohongshu.com/explore/67d7c713000000000900e391?xsec_token=AB1ACxbo5cevHxV_bWibTmK8R1DDz0NnAW1PbFZLABXtE=&xsec_source=pc_user'
     success, msg, note_all_comment = xhs_apis.get_note_all_comment(note_url, cookies_str)
     logger.info(f'获取笔记评论结果 {json.dumps(note_all_comment, ensure_ascii=False)}: {success}, msg: {msg}')
-
 
 
 

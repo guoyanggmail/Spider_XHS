@@ -6,6 +6,7 @@ import {
   Languages,
   LayoutDashboard,
   LineChart,
+  MessageSquareReply,
   QrCode,
   Search,
   Send,
@@ -67,6 +68,9 @@ type OperationSummary = {
   monitor_total: number;
   monitor_enabled: number;
   search_result_total: number;
+  comment_reply_rule_total: number;
+  comment_reply_rule_enabled: number;
+  comment_reply_record_total: number;
   analytics_snapshot_total: number;
   latest_logs: OperationLog[];
 };
@@ -127,6 +131,49 @@ type AnalyticsSnapshot = {
   created_at: string;
 };
 
+type CommentReplyRule = {
+  id: string;
+  account_id: string;
+  note_url: string;
+  note_id: string;
+  xsec_token: string;
+  xsec_source: string;
+  keywords: string[];
+  reply_text: string;
+  max_replies_per_run: number;
+  enabled: boolean;
+  last_run_at?: string | null;
+  last_run_status?: string;
+  last_run_message?: string;
+};
+
+type CommentReplyRecord = {
+  id: string;
+  rule_id: string;
+  message_id?: string;
+  comment_id: string;
+  comment_nickname: string;
+  comment_content: string;
+  reply_text: string;
+  status: string;
+  message: string;
+  source?: string;
+  created_at: string;
+};
+
+type CommentInboxMessage = {
+  message_id: string;
+  message_type: string;
+  note_id: string;
+  note_url: string;
+  comment_id: string;
+  comment_content: string;
+  comment_nickname: string;
+  comment_user_id: string;
+  created_at: string;
+  replied: boolean;
+};
+
 type ExternalPublishConfig = {
   api_key_preview: string;
   has_api_key: boolean;
@@ -172,7 +219,7 @@ type ApiValidationError = {
 };
 
 type Lang = "zh" | "en";
-type TabKey = "dashboard" | "accounts" | "publish" | "tasks" | "profile" | "search" | "monitors" | "analytics";
+type TabKey = "dashboard" | "accounts" | "publish" | "tasks" | "profile" | "search" | "monitors" | "commentReplies" | "analytics";
 
 const initialStatus: Status = { type: "idle", text: "" };
 const tabs: Array<{ key: TabKey; zh: string; en: string }> = [
@@ -183,6 +230,7 @@ const tabs: Array<{ key: TabKey; zh: string; en: string }> = [
   { key: "profile", zh: "主页查询", en: "Profiles" },
   { key: "search", zh: "关键词查询", en: "Search" },
   { key: "monitors", zh: "关键词监控", en: "Monitors" },
+  { key: "commentReplies", zh: "评论回复", en: "Comment Replies" },
   { key: "analytics", zh: "账号分析", en: "Analytics" }
 ];
 
@@ -194,6 +242,7 @@ const tabIcons: Record<TabKey, React.ComponentType<{ "aria-hidden"?: boolean }>>
   profile: UserRound,
   search: Search,
   monitors: LineChart,
+  commentReplies: MessageSquareReply,
   analytics: BarChart3
 };
 
@@ -232,6 +281,8 @@ const labels = {
     dashboardPublishHistory: "发布历史",
     dashboardPublished: "已发布记录",
     enabledMonitors: "启用监控",
+    commentReplyRules: "评论回复规则",
+    repliedComments: "已回复评论",
     monitorResults: "监控结果",
     accountSnapshots: "账号快照",
     recentOps: "最近操作",
@@ -301,6 +352,22 @@ const labels = {
     notRun: "未执行",
     runOnce: "执行一次",
     noMonitors: "还没有关键词监控。",
+    commentAutoReply: "评论自动回复",
+    unreadCommentInbox: "未读评论工作台",
+    loadUnreadComments: "拉取未读评论",
+    unreadComments: "未读评论",
+    replyNow: "立即回复",
+    suggestedReply: "建议回复",
+    noteUrl: "笔记链接",
+    keywordsOptional: "关键词，逗号或换行分隔",
+    replyTemplate: "回复模板",
+    maxRepliesPerRun: "单次最多回复",
+    saveReplyRule: "保存规则",
+    replyRuleList: "回复规则列表",
+    noReplyRules: "还没有评论回复规则。",
+    replyRecords: "回复记录",
+    noReplyRecords: "还没有回复记录。",
+    noUnreadComments: "当前没有可处理的未读评论。",
     analytics: "账号分析",
     collectSnapshot: "采集当前账号快照",
     unknownAccount: "未知账号",
@@ -361,6 +428,16 @@ const labels = {
     monitorDone: "监控完成，返回 {returned} 条，新增 {saved} 条",
     deletingMonitor: "正在删除关键词监控...",
     monitorDeleted: "关键词监控已删除",
+    savingReplyRule: "正在保存评论回复规则...",
+    replyRuleSaved: "评论回复规则已保存",
+    runningReplyRule: "正在执行评论回复规则...",
+    replyRuleDone: "评论回复执行完成：发送 {sent} 条，失败 {failed} 条，命中 {matched} 条",
+    deletingReplyRule: "正在删除评论回复规则...",
+    replyRuleDeleted: "评论回复规则已删除",
+    loadingUnreadComments: "正在拉取未读评论...",
+    unreadCommentsLoaded: "已拉取 {count} 条未读评论",
+    replyingComment: "正在回复评论...",
+    commentReplied: "评论已回复",
     deletingHistory: "正在删除发布历史...",
     historyDeleted: "发布历史已删除",
     collectingSnapshot: "正在采集账号快照...",
@@ -411,6 +488,8 @@ const labels = {
     dashboardPublishHistory: "Publish history",
     dashboardPublished: "Published records",
     enabledMonitors: "Enabled monitors",
+    commentReplyRules: "Comment reply rules",
+    repliedComments: "Replied comments",
     monitorResults: "Monitor results",
     accountSnapshots: "Account snapshots",
     recentOps: "Recent activity",
@@ -480,6 +559,22 @@ const labels = {
     notRun: "Not run",
     runOnce: "Run Once",
     noMonitors: "No keyword monitors yet.",
+    commentAutoReply: "Comment Auto Reply",
+    unreadCommentInbox: "Unread Comment Inbox",
+    loadUnreadComments: "Load Unread Comments",
+    unreadComments: "Unread Comments",
+    replyNow: "Reply Now",
+    suggestedReply: "Suggested Reply",
+    noteUrl: "Note URL",
+    keywordsOptional: "Keywords, split by commas or new lines",
+    replyTemplate: "Reply template",
+    maxRepliesPerRun: "Max replies per run",
+    saveReplyRule: "Save Rule",
+    replyRuleList: "Reply Rules",
+    noReplyRules: "No comment reply rules yet.",
+    replyRecords: "Reply Records",
+    noReplyRecords: "No reply records yet.",
+    noUnreadComments: "No unread comments to handle.",
     analytics: "Analytics",
     collectSnapshot: "Collect Snapshot",
     unknownAccount: "Unknown account",
@@ -540,6 +635,16 @@ const labels = {
     monitorDone: "Monitor finished. Returned {returned}, new {saved}",
     deletingMonitor: "Deleting keyword monitor...",
     monitorDeleted: "Keyword monitor deleted",
+    savingReplyRule: "Saving comment reply rule...",
+    replyRuleSaved: "Comment reply rule saved",
+    runningReplyRule: "Running comment reply rule...",
+    replyRuleDone: "Reply run finished. Sent {sent}, failed {failed}, matched {matched}",
+    deletingReplyRule: "Deleting comment reply rule...",
+    replyRuleDeleted: "Comment reply rule deleted",
+    loadingUnreadComments: "Loading unread comments...",
+    unreadCommentsLoaded: "Loaded {count} unread comments",
+    replyingComment: "Replying to comment...",
+    commentReplied: "Comment replied",
     deletingHistory: "Deleting publish history...",
     historyDeleted: "Publish history deleted",
     collectingSnapshot: "Collecting account snapshot...",
@@ -660,6 +765,14 @@ function App() {
   const [monitorKeyword, setMonitorKeyword] = useState("");
   const [monitorInterval, setMonitorInterval] = useState("60");
   const [savedSearchResults, setSavedSearchResults] = useState<SavedSearchResult[]>([]);
+  const [commentReplyRules, setCommentReplyRules] = useState<CommentReplyRule[]>([]);
+  const [commentReplyRecords, setCommentReplyRecords] = useState<CommentReplyRecord[]>([]);
+  const [commentInboxMessages, setCommentInboxMessages] = useState<CommentInboxMessage[]>([]);
+  const [inboxReplyDrafts, setInboxReplyDrafts] = useState<Record<string, string>>({});
+  const [commentReplyNoteUrl, setCommentReplyNoteUrl] = useState("");
+  const [commentReplyKeywords, setCommentReplyKeywords] = useState("");
+  const [commentReplyText, setCommentReplyText] = useState("");
+  const [commentReplyLimit, setCommentReplyLimit] = useState("3");
   const [analyticsSnapshots, setAnalyticsSnapshots] = useState<AnalyticsSnapshot[]>([]);
   const [externalConfig, setExternalConfig] = useState<ExternalPublishConfig | null>(null);
   const [externalApiKey, setExternalApiKey] = useState("");
@@ -683,11 +796,13 @@ function App() {
   }
 
   async function loadOperations() {
-    const [summaryData, historyData, monitorsData, resultsData, snapshotsData, externalConfigData, externalRecordsData] = await Promise.all([
+    const [summaryData, historyData, monitorsData, resultsData, replyRulesData, replyRecordsData, snapshotsData, externalConfigData, externalRecordsData] = await Promise.all([
       apiFetch<{ summary: OperationSummary }>("/api/ops/summary"),
       apiFetch<{ items: PublishHistoryItem[] }>("/api/publish-history"),
       apiFetch<{ monitors: SearchMonitor[] }>("/api/search-monitors"),
       apiFetch<{ results: SavedSearchResult[] }>("/api/search-results"),
+      apiFetch<{ rules: CommentReplyRule[] }>("/api/comment-reply-rules"),
+      apiFetch<{ records: CommentReplyRecord[] }>("/api/comment-reply-records"),
       apiFetch<{ snapshots: AnalyticsSnapshot[] }>("/api/analytics/snapshots"),
       apiFetch<{ config: ExternalPublishConfig }>("/api/external-publish/config"),
       apiFetch<{ records: ExternalPublishRecord[] }>("/api/external-publish/records")
@@ -696,6 +811,8 @@ function App() {
     setPublishHistory(historyData.items);
     setSearchMonitors(monitorsData.monitors);
     setSavedSearchResults(resultsData.results);
+    setCommentReplyRules(replyRulesData.rules);
+    setCommentReplyRecords(replyRecordsData.records);
     setAnalyticsSnapshots(snapshotsData.snapshots);
     setExternalConfig(externalConfigData.config);
     setExternalRecords(externalRecordsData.records);
@@ -970,6 +1087,123 @@ function App() {
     }
   }
 
+  async function createCommentReplyRule(event: FormEvent) {
+    event.preventDefault();
+    if (!requireSelectedAccount() || !commentReplyNoteUrl.trim() || !commentReplyText.trim()) return;
+    setStatus({ type: "loading", text: text.savingReplyRule });
+    try {
+      await apiFetch<{ rule: CommentReplyRule }>("/api/comment-reply-rules", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          account_id: selectedAccountId,
+          note_url: commentReplyNoteUrl.trim(),
+          keywords: commentReplyKeywords.split(/[\n,，]/).map((item) => item.trim()).filter(Boolean),
+          reply_text: commentReplyText.trim(),
+          max_replies_per_run: Number(commentReplyLimit) || 3,
+          enabled: true
+        })
+      });
+      setCommentReplyNoteUrl("");
+      setCommentReplyKeywords("");
+      setCommentReplyText("");
+      setCommentReplyLimit("3");
+      await loadOperations();
+      setStatus({ type: "success", text: text.replyRuleSaved });
+    } catch (error) {
+      setStatus({ type: "error", text: (error as Error).message });
+    }
+  }
+
+  function buildSuggestedReply(message: CommentInboxMessage): string {
+    return `你好，${message.comment_nickname || ""}，收到你的评论了，这边回复你。`.trim();
+  }
+
+  async function loadCommentInbox() {
+    if (!requireSelectedAccount()) return;
+    setStatus({ type: "loading", text: text.loadingUnreadComments });
+    try {
+      const data = await apiFetch<{ messages: CommentInboxMessage[] }>("/api/comment-inbox", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ account_id: selectedAccountId })
+      });
+      setCommentInboxMessages(data.messages);
+      setInboxReplyDrafts(
+        Object.fromEntries(
+          data.messages.map((item) => [item.message_id || item.comment_id, buildSuggestedReply(item)])
+        )
+      );
+      setStatus({ type: "success", text: template(text.unreadCommentsLoaded, { count: data.messages.length }) });
+    } catch (error) {
+      setStatus({ type: "error", text: (error as Error).message });
+    }
+  }
+
+  async function replyInboxMessage(message: CommentInboxMessage) {
+    if (!requireSelectedAccount()) return;
+    const draftKey = message.message_id || message.comment_id;
+    const replyText = (inboxReplyDrafts[draftKey] || "").trim();
+    if (!replyText) return;
+    setStatus({ type: "loading", text: text.replyingComment });
+    try {
+      await apiFetch<{ record: CommentReplyRecord }>("/api/comment-inbox/reply", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          account_id: selectedAccountId,
+          note_id: message.note_id,
+          note_url: message.note_url,
+          message_id: message.message_id,
+          comment_id: message.comment_id,
+          comment_user_id: message.comment_user_id,
+          comment_nickname: message.comment_nickname,
+          comment_content: message.comment_content,
+          reply_text: replyText
+        })
+      });
+      await loadOperations();
+      setCommentInboxMessages((current) =>
+        current.map((item) =>
+          (item.message_id || item.comment_id) === draftKey ? { ...item, replied: true } : item
+        )
+      );
+      setStatus({ type: "success", text: text.commentReplied });
+    } catch (error) {
+      await loadOperations().catch(() => undefined);
+      setStatus({ type: "error", text: (error as Error).message });
+    }
+  }
+
+  async function runCommentReplyRule(ruleId: string) {
+    setStatus({ type: "loading", text: text.runningReplyRule });
+    try {
+      const data = await apiFetch<{ sent: CommentReplyRecord[]; failed: CommentReplyRecord[]; matched: unknown[] }>(
+        `/api/comment-reply-rules/${ruleId}/run`,
+        { method: "POST" }
+      );
+      await loadOperations();
+      setStatus({
+        type: data.failed.length > 0 ? "error" : "success",
+        text: template(text.replyRuleDone, { sent: data.sent.length, failed: data.failed.length, matched: data.matched.length })
+      });
+    } catch (error) {
+      await loadOperations().catch(() => undefined);
+      setStatus({ type: "error", text: (error as Error).message });
+    }
+  }
+
+  async function deleteCommentReplyRule(ruleId: string) {
+    setStatus({ type: "loading", text: text.deletingReplyRule });
+    try {
+      await apiFetch(`/api/comment-reply-rules/${ruleId}`, { method: "DELETE" });
+      await loadOperations();
+      setStatus({ type: "success", text: text.replyRuleDeleted });
+    } catch (error) {
+      setStatus({ type: "error", text: (error as Error).message });
+    }
+  }
+
   async function deletePublishHistoryItem(taskId: string) {
     setStatus({ type: "loading", text: text.deletingHistory });
     try {
@@ -1227,6 +1461,14 @@ function App() {
             <div className="stat-card">
               <strong>{summary?.search_result_total || 0}</strong>
               <span>{text.monitorResults}</span>
+            </div>
+            <div className="stat-card">
+              <strong>{summary?.comment_reply_rule_enabled || 0}</strong>
+              <span>{text.commentReplyRules}</span>
+            </div>
+            <div className="stat-card">
+              <strong>{summary?.comment_reply_record_total || 0}</strong>
+              <span>{text.repliedComments}</span>
             </div>
             <div className="stat-card">
               <strong>{summary?.analytics_snapshot_total || 0}</strong>
@@ -1665,6 +1907,133 @@ function App() {
               />
             </section>
           )}
+        </section>
+      )}
+
+      {activeTab === "commentReplies" && (
+        <section className="layout two-panel-layout">
+          <section className="panel">
+            <div className="section-head">
+              <h2>{text.unreadCommentInbox}</h2>
+              <button type="button" onClick={loadCommentInbox} disabled={!selectedAccountId}>{text.loadUnreadComments}</button>
+            </div>
+            <div className="table-list">
+              {commentInboxMessages.map((message) => {
+                const draftKey = message.message_id || message.comment_id;
+                return (
+                  <div className="list-row" key={draftKey}>
+                    <strong>{message.comment_nickname || text.unknownUser}</strong>
+                    <span>{message.replied ? text.saved : text.unchecked}</span>
+                    <span>{message.comment_content}</span>
+                    <span>{message.note_id}</span>
+                    <label>
+                      {text.suggestedReply}
+                      <textarea
+                        value={inboxReplyDrafts[draftKey] || ""}
+                        onChange={(event) =>
+                          setInboxReplyDrafts((current) => ({ ...current, [draftKey]: event.target.value }))
+                        }
+                        rows={3}
+                      />
+                    </label>
+                    <div className="row-actions">
+                      {message.note_url && (
+                        <a href={message.note_url} target="_blank" rel="noreferrer">{text.openNote}</a>
+                      )}
+                      <button type="button" onClick={() => replyInboxMessage(message)} disabled={message.replied}>
+                        {text.replyNow}
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+              {commentInboxMessages.length === 0 && <p className="empty-state">{text.noUnreadComments}</p>}
+            </div>
+          </section>
+
+          <section className="panel">
+            <h2>{text.commentAutoReply}</h2>
+            <form onSubmit={createCommentReplyRule} className="stack">
+              <label>
+                {text.noteUrl}
+                <input
+                  value={commentReplyNoteUrl}
+                  onChange={(event) => setCommentReplyNoteUrl(event.target.value)}
+                  placeholder="https://www.xiaohongshu.com/explore/..."
+                  required
+                />
+              </label>
+              <label>
+                {text.keywordsOptional}
+                <textarea
+                  value={commentReplyKeywords}
+                  onChange={(event) => setCommentReplyKeywords(event.target.value)}
+                  rows={3}
+                />
+              </label>
+              <label>
+                {text.replyTemplate}
+                <textarea
+                  value={commentReplyText}
+                  onChange={(event) => setCommentReplyText(event.target.value)}
+                  rows={4}
+                  placeholder="{nickname} {content}"
+                  required
+                />
+              </label>
+              <label>
+                {text.maxRepliesPerRun}
+                <input
+                  type="number"
+                  min="1"
+                  max="20"
+                  value={commentReplyLimit}
+                  onChange={(event) => setCommentReplyLimit(event.target.value)}
+                />
+              </label>
+              <button type="submit" className="primary" disabled={!selectedAccountId}>
+                {text.saveReplyRule}
+              </button>
+            </form>
+          </section>
+
+          <section className="panel">
+            <div className="section-head">
+              <h2>{text.replyRuleList}</h2>
+              <button type="button" onClick={loadOperations}>{text.refresh}</button>
+            </div>
+            <div className="table-list">
+              {commentReplyRules.map((rule) => (
+                <div className="list-row" key={rule.id}>
+                  <strong>{rule.note_id || rule.note_url}</strong>
+                  <span>{rule.keywords.length > 0 ? rule.keywords.join(" / ") : text.unlimited}</span>
+                  <span>{rule.last_run_status || text.notRun} {rule.last_run_message || ""}</span>
+                  <span>{rule.reply_text}</span>
+                  <div className="row-actions">
+                    <button type="button" onClick={() => runCommentReplyRule(rule.id)}>{text.runOnce}</button>
+                    <button type="button" className="danger" onClick={() => deleteCommentReplyRule(rule.id)}>{text.delete}</button>
+                  </div>
+                </div>
+              ))}
+              {commentReplyRules.length === 0 && <p className="empty-state">{text.noReplyRules}</p>}
+            </div>
+          </section>
+
+          <section className="panel wide-panel">
+            <h2>{text.replyRecords}</h2>
+            <div className="table-list">
+              {commentReplyRecords.map((record) => (
+                <div className="list-row" key={record.id}>
+                  <strong>{record.comment_nickname || text.unknownUser}</strong>
+                  <span>{record.status} · {record.created_at}</span>
+                  <span>{record.comment_content}</span>
+                  <span>{record.reply_text}</span>
+                  {record.message && <span>{record.message}</span>}
+                </div>
+              ))}
+              {commentReplyRecords.length === 0 && <p className="empty-state">{text.noReplyRecords}</p>}
+            </div>
+          </section>
         </section>
       )}
 
