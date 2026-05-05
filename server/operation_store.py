@@ -31,6 +31,8 @@ class OperationStore:
             "publish_tasks": [],
             "search_monitors": [],
             "search_results": [],
+            "comment_reply_rules": [],
+            "comment_reply_records": [],
             "analytics_snapshots": [],
             "external_publish": {
                 "api_key": "",
@@ -86,6 +88,9 @@ class OperationStore:
             "monitor_total": len(monitors),
             "monitor_enabled": len([item for item in monitors if item.get("enabled", True)]),
             "search_result_total": len(data["search_results"]),
+            "comment_reply_rule_total": len(data["comment_reply_rules"]),
+            "comment_reply_rule_enabled": len([item for item in data["comment_reply_rules"] if item.get("enabled", True)]),
+            "comment_reply_record_total": len(data["comment_reply_records"]),
             "analytics_snapshot_total": len(snapshots),
             "external_publish_total": len(data["external_publish_records"]),
             "latest_logs": data["logs"][:20],
@@ -286,6 +291,95 @@ class OperationStore:
         data["search_results"] = data["search_results"][:1000]
         self._write(data)
         return saved
+
+    def list_comment_reply_rules(self) -> list[dict[str, Any]]:
+        return self._read()["comment_reply_rules"]
+
+    def create_comment_reply_rule(self, payload: dict[str, Any]) -> dict[str, Any]:
+        data = self._read()
+        now = utc_now()
+        item = {
+            "id": str(uuid.uuid4()),
+            "account_id": payload["account_id"],
+            "note_url": payload["note_url"].strip(),
+            "note_id": payload.get("note_id", "").strip(),
+            "xsec_token": payload.get("xsec_token", "").strip(),
+            "xsec_source": payload.get("xsec_source", "pc_search").strip() or "pc_search",
+            "keywords": payload.get("keywords", []),
+            "reply_text": payload.get("reply_text", "").strip(),
+            "max_replies_per_run": payload.get("max_replies_per_run", 3),
+            "enabled": payload.get("enabled", True),
+            "last_run_at": None,
+            "last_run_status": "",
+            "last_run_message": "",
+            "created_at": now,
+            "updated_at": now,
+        }
+        data["comment_reply_rules"].insert(0, item)
+        self._write(data)
+        return item
+
+    def get_comment_reply_rule(self, rule_id: str) -> dict[str, Any] | None:
+        return next((item for item in self._read()["comment_reply_rules"] if item["id"] == rule_id), None)
+
+    def delete_comment_reply_rule(self, rule_id: str) -> bool:
+        data = self._read()
+        before = len(data["comment_reply_rules"])
+        data["comment_reply_rules"] = [item for item in data["comment_reply_rules"] if item["id"] != rule_id]
+        if len(data["comment_reply_rules"]) == before:
+            return False
+        self._write(data)
+        return True
+
+    def update_comment_reply_rule_run(self, rule_id: str, status: str, message: str) -> dict[str, Any] | None:
+        data = self._read()
+        now = utc_now()
+        for item in data["comment_reply_rules"]:
+            if item["id"] == rule_id:
+                item["last_run_at"] = now
+                item["last_run_status"] = status
+                item["last_run_message"] = message
+                item["updated_at"] = now
+                self._write(data)
+                return item
+        return None
+
+    def list_comment_reply_records(self, rule_id: str | None = None) -> list[dict[str, Any]]:
+        records = self._read()["comment_reply_records"]
+        if not rule_id:
+            return records
+        return [item for item in records if item.get("rule_id") == rule_id]
+
+    def has_successful_comment_reply(self, rule_id: str, comment_id: str) -> bool:
+        return any(
+            item.get("rule_id") == rule_id and item.get("comment_id") == comment_id and item.get("status") == "sent"
+            for item in self._read()["comment_reply_records"]
+        )
+
+    def save_comment_reply_record(self, payload: dict[str, Any]) -> dict[str, Any]:
+        data = self._read()
+        item = {
+            "id": str(uuid.uuid4()),
+            "rule_id": payload.get("rule_id", ""),
+            "account_id": payload["account_id"],
+            "note_id": payload.get("note_id", ""),
+            "note_url": payload.get("note_url", ""),
+            "comment_id": payload.get("comment_id", ""),
+            "message_id": payload.get("message_id", ""),
+            "comment_user_id": payload.get("comment_user_id", ""),
+            "comment_nickname": payload.get("comment_nickname", ""),
+            "comment_content": payload.get("comment_content", ""),
+            "reply_text": payload.get("reply_text", ""),
+            "status": payload.get("status", ""),
+            "message": payload.get("message", ""),
+            "source": payload.get("source", "rule"),
+            "response": payload.get("response"),
+            "created_at": utc_now(),
+        }
+        data["comment_reply_records"].insert(0, item)
+        data["comment_reply_records"] = data["comment_reply_records"][:500]
+        self._write(data)
+        return item
 
     def list_search_results(self, monitor_id: str | None = None) -> list[dict[str, Any]]:
         results = self._read()["search_results"]

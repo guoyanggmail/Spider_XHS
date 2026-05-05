@@ -55,6 +55,49 @@ class FakePcApi:
         return True, "ok", {"data": {"basic_info": {"nickname": "cookie-name"}}}
 
 
+class FakeCommentPcApi:
+    def get_user_self_info2(self, cookies):
+        return True, "ok", {"data": {"basic_info": {"nickname": "brand", "user_id": "self-user"}}}
+
+    def get_note_all_comment(self, note_url, cookies):
+        return True, "ok", [
+            {
+                "id": "comment-1",
+                "note_id": "note-1",
+                "note_url": note_url,
+                "content": "请问价格多少",
+                "user_info": {"user_id": "user-1", "nickname": "访客A"},
+                "sub_comments": [],
+            },
+            {
+                "id": "comment-2",
+                "note_id": "note-1",
+                "note_url": note_url,
+                "content": "路过看看",
+                "user_info": {"user_id": "user-2", "nickname": "访客B"},
+                "sub_comments": [],
+            },
+        ]
+
+    def post_comment(self, note_id, content, cookies, root_comment_id="", parent_comment_id="", at_users=None, proxies=None):
+        return True, "ok", {"success": True, "data": {"note_id": note_id, "content": content, "root_comment_id": root_comment_id}}
+
+    def get_unread_message(self, cookies):
+        return True, "ok", {"data": {"mention": 1, "count": 1}}
+
+    def get_all_metions(self, cookies):
+        return True, "ok", [
+            {
+                "id": "message-1",
+                "note_id": "note-1",
+                "note_url": "https://www.xiaohongshu.com/explore/note-1?xsec_token=abc",
+                "comment_id": "comment-1",
+                "content": "请问价格多少",
+                "user_info": {"user_id": "user-1", "nickname": "访客A"},
+            }
+        ]
+
+
 @pytest.fixture()
 def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     account_store = AccountStore(tmp_path / "accounts.json")
@@ -176,6 +219,77 @@ def test_search_monitor_rejects_too_short_interval(client: TestClient):
     assert response.status_code == 422
     detail = response.json()["detail"]
     assert detail[0]["loc"][-1] == "interval_minutes"
+
+
+def test_comment_reply_rule_crud_and_run(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    account_id = create_account(client)
+    main.risk_guard.set_cookie_cache(account_id, True, "Cookie 可用")
+    monkeypatch.setattr(main, "pc_api", FakeCommentPcApi())
+
+    response = client.post(
+        "/api/comment-reply-rules",
+        json={
+            "account_id": account_id,
+            "note_url": "https://www.xiaohongshu.com/explore/note-1?xsec_token=abc&xsec_source=pc_search",
+            "keywords": ["价格", "多少钱"],
+            "reply_text": "你好，{nickname}，这边私信你报价。",
+            "max_replies_per_run": 2,
+        },
+    )
+    assert response.status_code == 200
+    rule = response.json()["rule"]
+    assert rule["note_id"] == "note-1"
+    assert rule["xsec_token"] == "abc"
+
+    response = client.post(f"/api/comment-reply-rules/{rule['id']}/run")
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["matched"]) == 1
+    assert len(body["sent"]) == 1
+    assert body["failed"] == []
+
+    records = client.get("/api/comment-reply-records").json()["records"]
+    assert len(records) == 1
+    assert records[0]["comment_id"] == "comment-1"
+    assert "访客A" in records[0]["reply_text"]
+
+    response = client.post(f"/api/comment-reply-rules/{rule['id']}/run")
+    assert response.status_code == 200
+    assert response.json()["sent"] == []
+
+    response = client.delete(f"/api/comment-reply-rules/{rule['id']}")
+    assert response.status_code == 200
+
+
+def test_comment_inbox_load_and_reply(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    account_id = create_account(client)
+    main.risk_guard.set_cookie_cache(main.cookie_cache_key(account_id, "pc"), True, "Cookie 可用")
+    monkeypatch.setattr(main, "pc_api", FakeCommentPcApi())
+
+    response = client.post("/api/comment-inbox", json={"account_id": account_id})
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["messages"]) == 1
+    assert body["messages"][0]["comment_id"] == "comment-1"
+
+    response = client.post(
+        "/api/comment-inbox/reply",
+        json={
+            "account_id": account_id,
+            "note_id": "note-1",
+            "note_url": "https://www.xiaohongshu.com/explore/note-1?xsec_token=abc",
+            "message_id": "message-1",
+            "comment_id": "comment-1",
+            "comment_user_id": "user-1",
+            "comment_nickname": "访客A",
+            "comment_content": "请问价格多少",
+            "reply_text": "你好，这边回复你。",
+        },
+    )
+    assert response.status_code == 200
+    record = response.json()["record"]
+    assert record["source"] == "inbox"
+    assert record["message_id"] == "message-1"
 
 
 def test_search_results_are_deduped_by_note_id(tmp_path: Path):

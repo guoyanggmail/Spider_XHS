@@ -276,6 +276,31 @@ class SearchMonitorCreate(BaseModel):
     enabled: bool = True
 
 
+class CommentReplyRuleCreate(BaseModel):
+    account_id: str
+    note_url: str = Field(min_length=20, max_length=500)
+    keywords: list[str] = []
+    reply_text: str = Field(min_length=1, max_length=300)
+    max_replies_per_run: int = Field(default=3, ge=1, le=20)
+    enabled: bool = True
+
+
+class CommentInboxRequest(BaseModel):
+    account_id: str
+
+
+class CommentInboxReplyRequest(BaseModel):
+    account_id: str
+    note_id: str = Field(min_length=1, max_length=80)
+    note_url: str = Field(default="", max_length=500)
+    message_id: str = Field(default="", max_length=120)
+    comment_id: str = Field(min_length=1, max_length=120)
+    comment_user_id: str = Field(default="", max_length=120)
+    comment_nickname: str = Field(default="", max_length=120)
+    comment_content: str = Field(default="", max_length=1000)
+    reply_text: str = Field(min_length=1, max_length=300)
+
+
 class ExternalPublishConfigRequest(BaseModel):
     api_key: str = Field(default="", max_length=500)
     base_url: str = Field(default="https://www.myaibot.vip", max_length=200)
@@ -300,9 +325,25 @@ def require_account(account_id: str) -> dict:
     return account
 
 
-def require_valid_account(account_id: str) -> dict:
+def cookie_cache_key(account_id: str, scope: str) -> str:
+    return f"{account_id}:{scope}"
+
+
+def require_valid_pc_account(account_id: str) -> dict:
     account = require_account(account_id)
-    cached = risk_guard.get_cookie_cache(account_id)
+    cached = risk_guard.get_cookie_cache(cookie_cache_key(account_id, "pc"))
+    if cached:
+        cookie_ok, cookie_msg = cached
+    else:
+        cookie_ok, cookie_msg, _ = check_pc_cookie(account_id)
+    if not cookie_ok:
+        raise HTTPException(status_code=400, detail=f"Cookie 不可用: {cookie_msg}")
+    return account
+
+
+def require_valid_creator_account(account_id: str) -> dict:
+    account = require_account(account_id)
+    cached = risk_guard.get_cookie_cache(cookie_cache_key(account_id, "creator"))
     if cached:
         cookie_ok, cookie_msg = cached
     else:
@@ -415,7 +456,7 @@ def check_qr_login_session(session_id: str, payload: LoginQrCheck) -> dict:
         account_name = payload.account_name.strip() or default_name
         account = store.create_account(account_name, login_api.cookies_to_str(cookies))
         store.update_check_status(account["id"], "valid" if user_success else "unchecked")
-        risk_guard.set_cookie_cache(account["id"], True, "扫码登录成功")
+        risk_guard.set_cookie_cache(cookie_cache_key(account["id"], "pc"), True, "扫码登录成功")
         account = store.get_account(account["id"])
         account = store.to_public(account) if account else None
 
@@ -428,10 +469,35 @@ def check_qr_login_session(session_id: str, payload: LoginQrCheck) -> dict:
     }
 
 
+def check_pc_cookie(account_id: str, force: bool = False) -> tuple[bool, str, dict | None]:
+    account = require_account(account_id)
+    cache_key = cookie_cache_key(account_id, "pc")
+    if not force:
+        cached = risk_guard.get_cookie_cache(cache_key)
+        if cached:
+            is_valid, msg = cached
+            return is_valid, msg, None
+    try:
+        success, msg, res_json = guarded_xhs_call(account_id, pc_api.get_user_self_info2, account["cookies"])
+        if not success:
+            success, msg, res_json = guarded_xhs_call(account_id, pc_api.get_user_self_info, account["cookies"])
+    except Exception as exc:
+        success, msg, res_json = False, str(exc), None
+
+    data = res_json.get("data") if isinstance(res_json, dict) else None
+    is_valid = bool(success and isinstance(data, dict))
+    if not is_valid and not msg:
+        msg = "PC Cookie 无效或登录状态异常"
+    final_msg = msg or "PC Cookie 可用"
+    risk_guard.set_cookie_cache(cache_key, is_valid, final_msg)
+    return is_valid, final_msg, res_json
+
+
 def check_creator_cookie(account_id: str, force: bool = False) -> tuple[bool, str, dict | None]:
     account = require_account(account_id)
+    cache_key = cookie_cache_key(account_id, "creator")
     if not force:
-        cached = risk_guard.get_cookie_cache(account_id)
+        cached = risk_guard.get_cookie_cache(cache_key)
         if cached:
             is_valid, msg = cached
             return is_valid, msg, None
@@ -452,7 +518,7 @@ def check_creator_cookie(account_id: str, force: bool = False) -> tuple[bool, st
     if not is_valid and not msg:
         msg = "Cookie 无效或登录状态异常"
     final_msg = msg or "Cookie 可用"
-    risk_guard.set_cookie_cache(account_id, is_valid, final_msg)
+    risk_guard.set_cookie_cache(cache_key, is_valid, final_msg)
     return is_valid, final_msg, res_json
 
 
@@ -591,6 +657,28 @@ def build_note_url(note_id: str, xsec_token: str = "", xsec_source: str = "pc_se
     return f"https://www.xiaohongshu.com/explore/{note_id}{suffix}"
 
 
+def parse_note_url(value: str) -> dict[str, str]:
+    value = value.strip()
+    parsed = urlparse(value)
+    parts = [part for part in parsed.path.split("/") if part]
+    note_id = parts[-1] if parts else ""
+    if not note_id:
+        raise HTTPException(status_code=400, detail="无法从笔记链接解析 note_id")
+    query_pairs = {}
+    if parsed.query:
+        for part in parsed.query.split("&"):
+            if "=" not in part:
+                continue
+            key, raw_value = part.split("=", 1)
+            query_pairs[key] = raw_value
+    return {
+        "note_id": note_id,
+        "xsec_token": query_pairs.get("xsec_token", ""),
+        "xsec_source": query_pairs.get("xsec_source", "pc_search") or "pc_search",
+        "note_url": value,
+    }
+
+
 def normalize_search_note(item: dict) -> dict:
     note_card = item.get("note_card") or item.get("noteCard") or {}
     note_id = item.get("id") or item.get("note_id") or item.get("noteId") or note_card.get("note_id") or ""
@@ -710,6 +798,250 @@ def enrich_search_note(item: dict, cookies_str: str) -> dict:
     except Exception:
         return note
     return note
+
+
+def normalize_comment(item: dict) -> dict:
+    user = item.get("user_info") or {}
+    sub_comments = item.get("sub_comments") or []
+    return {
+        "comment_id": item.get("id") or "",
+        "note_id": item.get("note_id") or "",
+        "note_url": item.get("note_url") or "",
+        "content": item.get("content") or "",
+        "nickname": user.get("nickname") or "",
+        "user_id": user.get("user_id") or "",
+        "reply_count": len(sub_comments),
+        "sub_comments": [normalize_comment(sub) for sub in sub_comments if isinstance(sub, dict)],
+    }
+
+
+def match_comment_keywords(content: str, keywords: list[str]) -> bool:
+    normalized = (content or "").strip().lower()
+    active_keywords = [item.strip().lower() for item in keywords if item.strip()]
+    if not active_keywords:
+        return True
+    return any(keyword in normalized for keyword in active_keywords)
+
+
+def render_reply_text(template: str, comment: dict) -> str:
+    reply_text = (template or "").strip()
+    if not reply_text:
+        return ""
+    return (
+        reply_text
+        .replace("{nickname}", str(comment.get("nickname") or "").strip())
+        .replace("{content}", str(comment.get("content") or "").strip())
+    )
+
+
+def has_self_reply(comment: dict, self_user_id: str) -> bool:
+    if not self_user_id:
+        return False
+    return any(str(item.get("user_id") or "") == self_user_id for item in comment.get("sub_comments") or [])
+
+
+def pick_first_value(candidates: list):
+    for item in candidates:
+        if item not in (None, "", [], {}):
+            return item
+    return ""
+
+
+def nested_get(data: dict, path: list[str]):
+    current = data
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def normalize_mention_message(item: dict) -> dict:
+    note_info = pick_first_value([
+        item.get("note"),
+        item.get("note_info"),
+        item.get("noteCard"),
+        item.get("note_card"),
+        nested_get(item, ["target", "note"]),
+        nested_get(item, ["target", "note_info"]),
+    ]) or {}
+    comment_info = pick_first_value([
+        item.get("comment"),
+        item.get("comment_info"),
+        nested_get(item, ["target", "comment"]),
+        nested_get(item, ["target", "comment_info"]),
+    ]) or {}
+    user_info = pick_first_value([
+        item.get("user"),
+        item.get("user_info"),
+        comment_info.get("user_info") if isinstance(comment_info, dict) else {},
+        nested_get(item, ["target", "user"]),
+    ]) or {}
+    note_id = pick_first_value([
+        item.get("note_id"),
+        note_info.get("note_id") if isinstance(note_info, dict) else "",
+        note_info.get("id") if isinstance(note_info, dict) else "",
+    ])
+    comment_id = pick_first_value([
+        item.get("comment_id"),
+        comment_info.get("id") if isinstance(comment_info, dict) else "",
+        nested_get(item, ["target", "comment_id"]),
+    ])
+    content = pick_first_value([
+        comment_info.get("content") if isinstance(comment_info, dict) else "",
+        item.get("content"),
+        item.get("desc"),
+    ])
+    nickname = pick_first_value([
+        user_info.get("nickname") if isinstance(user_info, dict) else "",
+        user_info.get("nickName") if isinstance(user_info, dict) else "",
+        item.get("nickname"),
+    ])
+    user_id = pick_first_value([
+        user_info.get("user_id") if isinstance(user_info, dict) else "",
+        user_info.get("userid") if isinstance(user_info, dict) else "",
+        user_info.get("id") if isinstance(user_info, dict) else "",
+        item.get("user_id"),
+    ])
+    xsec_token = pick_first_value([
+        item.get("xsec_token"),
+        note_info.get("xsec_token") if isinstance(note_info, dict) else "",
+    ])
+    xsec_source = pick_first_value([
+        item.get("xsec_source"),
+        note_info.get("xsec_source") if isinstance(note_info, dict) else "",
+        "pc_search",
+    ])
+    note_url = pick_first_value([
+        item.get("note_url"),
+        note_info.get("note_url") if isinstance(note_info, dict) else "",
+        build_note_url(str(note_id), str(xsec_token), str(xsec_source)),
+    ])
+    return {
+        "message_id": str(pick_first_value([item.get("id"), item.get("message_id"), item.get("msg_id")])),
+        "message_type": str(pick_first_value([item.get("message_type"), item.get("type"), item.get("biz_type")])),
+        "note_id": str(note_id),
+        "note_url": str(note_url),
+        "comment_id": str(comment_id),
+        "comment_content": str(content),
+        "comment_nickname": str(nickname),
+        "comment_user_id": str(user_id),
+        "created_at": str(pick_first_value([item.get("time"), item.get("create_time"), item.get("created_at")])),
+        "raw": item,
+    }
+
+
+def list_unread_comment_messages(account_id: str, cookies_str: str) -> dict:
+    unread_success, unread_msg, unread_res = guarded_xhs_call(account_id, pc_api.get_unread_message, cookies_str)
+    if not unread_success:
+        raise HTTPException(status_code=400, detail=unread_msg)
+    mention_success, mention_msg, mention_items = guarded_xhs_call(account_id, pc_api.get_all_metions, cookies_str)
+    if not mention_success:
+        raise HTTPException(status_code=400, detail=mention_msg)
+    replied_comment_ids = {
+        str(item.get("comment_id") or "")
+        for item in ops_store.list_comment_reply_records()
+        if item.get("account_id") == account_id and item.get("status") == "sent"
+    }
+    messages = []
+    for item in mention_items:
+        if not isinstance(item, dict):
+            continue
+        normalized = normalize_mention_message(item)
+        if not normalized["note_id"] or not normalized["comment_id"] or not normalized["comment_content"].strip():
+            continue
+        normalized["replied"] = normalized["comment_id"] in replied_comment_ids
+        messages.append(normalized)
+    return {
+        "unread": (unread_res or {}).get("data") or {},
+        "messages": messages,
+    }
+
+
+def run_comment_reply_rule_once(rule: dict) -> dict:
+    account = require_valid_pc_account(rule["account_id"])
+    note_url = rule.get("note_url") or build_note_url(
+        rule.get("note_id", ""),
+        rule.get("xsec_token", ""),
+        rule.get("xsec_source", "pc_search"),
+    )
+    success, msg, res_json = guarded_xhs_call(rule["account_id"], pc_api.get_user_self_info2, account["cookies"])
+    if not success:
+        success, msg, res_json = guarded_xhs_call(rule["account_id"], pc_api.get_user_self_info, account["cookies"])
+    if not success:
+        raise HTTPException(status_code=400, detail=msg)
+    self_user_id = normalize_profile((res_json or {}).get("data") or {}).get("user_id", "")
+
+    success, msg, comments = guarded_xhs_call(rule["account_id"], pc_api.get_note_all_comment, note_url, account["cookies"])
+    if not success:
+        ops_store.update_comment_reply_rule_run(rule["id"], "failed", msg)
+        raise HTTPException(status_code=400, detail=msg)
+
+    normalized_comments = [normalize_comment(item) for item in comments if isinstance(item, dict)]
+    matched_comments = []
+    skipped = 0
+    for comment in normalized_comments:
+        if not comment["comment_id"] or not comment["content"].strip():
+            skipped += 1
+            continue
+        if str(comment.get("user_id") or "") == self_user_id:
+            skipped += 1
+            continue
+        if ops_store.has_successful_comment_reply(rule["id"], comment["comment_id"]):
+            skipped += 1
+            continue
+        if has_self_reply(comment, self_user_id):
+            skipped += 1
+            continue
+        if not match_comment_keywords(comment["content"], rule.get("keywords", [])):
+            skipped += 1
+            continue
+        matched_comments.append(comment)
+
+    sent = []
+    failed = []
+    limit = int(rule.get("max_replies_per_run", 3) or 3)
+    for comment in matched_comments[:limit]:
+        reply_text = render_reply_text(rule.get("reply_text", ""), comment)
+        success, msg, reply_res = guarded_xhs_call(
+            rule["account_id"],
+            pc_api.post_comment,
+            rule["note_id"],
+            reply_text,
+            account["cookies"],
+            comment["comment_id"],
+            comment["comment_id"],
+        )
+        record = ops_store.save_comment_reply_record(
+            {
+                "rule_id": rule["id"],
+                "account_id": rule["account_id"],
+                "note_id": rule["note_id"],
+                "note_url": note_url,
+                "comment_id": comment["comment_id"],
+                "comment_user_id": comment["user_id"],
+                "comment_nickname": comment["nickname"],
+                "comment_content": comment["content"],
+                "reply_text": reply_text,
+                "status": "sent" if success else "failed",
+                "message": msg,
+                "response": reply_res,
+            }
+        )
+        if success:
+            sent.append(record)
+        else:
+            failed.append(record)
+
+    summary = f"命中 {len(matched_comments)} 条，发送 {len(sent)} 条，失败 {len(failed)} 条，跳过 {skipped} 条"
+    ops_store.update_comment_reply_rule_run(rule["id"], "success" if not failed else "partial", summary)
+    return {
+        "matched": matched_comments,
+        "sent": sent,
+        "failed": failed,
+        "skipped": skipped,
+        "summary": summary,
+    }
 
 
 def validate_media_url(url: str) -> str:
@@ -839,9 +1171,14 @@ def check_login_qrcode(session_id: str, payload: LoginQrCheck) -> dict:
 def create_account(payload: AccountCreate) -> dict:
     account_name, source = resolve_account_name_from_cookies(payload.cookies, payload.name)
     account = store.create_account(account_name, payload.cookies)
-    if source in {"pc", "creator"}:
+    if source == "pc":
         store.update_check_status(account["id"], "valid")
-        risk_guard.set_cookie_cache(account["id"], True, "Cookie 可用")
+        risk_guard.set_cookie_cache(cookie_cache_key(account["id"], "pc"), True, "Cookie 可用")
+        account = store.get_account(account["id"])
+        account = store.to_public(account) if account else None
+    elif source == "creator":
+        store.update_check_status(account["id"], "valid")
+        risk_guard.set_cookie_cache(cookie_cache_key(account["id"], "creator"), True, "Cookie 可用")
         account = store.get_account(account["id"])
         account = store.to_public(account) if account else None
     return {"account": account, "name_source": source}
@@ -852,15 +1189,24 @@ def delete_account(account_id: str) -> dict:
     deleted = store.delete_account(account_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="账号不存在")
-    risk_guard.clear_cookie_cache(account_id)
+    risk_guard.clear_cookie_cache(cookie_cache_key(account_id, "pc"))
+    risk_guard.clear_cookie_cache(cookie_cache_key(account_id, "creator"))
     return {"success": True}
 
 
 @app.post("/api/accounts/{account_id}/check")
 def check_account(account_id: str) -> dict:
-    risk_guard.clear_cookie_cache(account_id)
-    success, msg, _ = check_creator_cookie(account_id, force=True)
-    return {"success": success, "msg": msg}
+    risk_guard.clear_cookie_cache(cookie_cache_key(account_id, "pc"))
+    risk_guard.clear_cookie_cache(cookie_cache_key(account_id, "creator"))
+    pc_success, pc_msg, _ = check_pc_cookie(account_id, force=True)
+    creator_success, creator_msg, _ = check_creator_cookie(account_id, force=True)
+    if pc_success and creator_success:
+        return {"success": True, "msg": "PC Cookie 可用；Creator Cookie 可用"}
+    if pc_success:
+        return {"success": True, "msg": f"PC Cookie 可用；Creator Cookie 不可用: {creator_msg}"}
+    if creator_success:
+        return {"success": True, "msg": f"Creator Cookie 可用；PC Cookie 不可用: {pc_msg}"}
+    return {"success": False, "msg": f"PC Cookie 不可用: {pc_msg}；Creator Cookie 不可用: {creator_msg}"}
 
 
 @app.get("/api/publish-tasks")
@@ -921,7 +1267,7 @@ def run_search_monitor(monitor_id: str) -> dict:
     monitor = ops_store.get_search_monitor(monitor_id)
     if not monitor:
         raise HTTPException(status_code=404, detail="监控任务不存在")
-    account = require_valid_account(monitor["account_id"])
+    account = require_valid_pc_account(monitor["account_id"])
     success, msg, notes = guarded_xhs_call(
         monitor["account_id"],
         pc_api.search_some_note,
@@ -941,6 +1287,87 @@ def run_search_monitor(monitor_id: str) -> dict:
     return {"notes": normalized, "saved": saved}
 
 
+@app.get("/api/comment-reply-rules")
+def list_comment_reply_rules() -> dict:
+    return {"rules": ops_store.list_comment_reply_rules()}
+
+
+@app.get("/api/comment-reply-records")
+def list_comment_reply_records(rule_id: str | None = None) -> dict:
+    return {"records": ops_store.list_comment_reply_records(rule_id)}
+
+
+@app.post("/api/comment-inbox")
+def get_comment_inbox(payload: CommentInboxRequest) -> dict:
+    account = require_valid_pc_account(payload.account_id)
+    return list_unread_comment_messages(payload.account_id, account["cookies"])
+
+
+@app.post("/api/comment-inbox/reply")
+def reply_comment_inbox_item(payload: CommentInboxReplyRequest) -> dict:
+    account = require_valid_pc_account(payload.account_id)
+    success, msg, reply_res = guarded_xhs_call(
+        payload.account_id,
+        pc_api.post_comment,
+        payload.note_id,
+        payload.reply_text,
+        account["cookies"],
+        payload.comment_id,
+        payload.comment_id,
+    )
+    record = ops_store.save_comment_reply_record(
+        {
+            "account_id": payload.account_id,
+            "rule_id": "",
+            "source": "inbox",
+            "message_id": payload.message_id,
+            "note_id": payload.note_id,
+            "note_url": payload.note_url,
+            "comment_id": payload.comment_id,
+            "comment_user_id": payload.comment_user_id,
+            "comment_nickname": payload.comment_nickname,
+            "comment_content": payload.comment_content,
+            "reply_text": payload.reply_text,
+            "status": "sent" if success else "failed",
+            "message": msg,
+            "response": reply_res,
+        }
+    )
+    if not success:
+        raise HTTPException(status_code=400, detail=msg)
+    return {"record": record}
+
+
+@app.post("/api/comment-reply-rules")
+def create_comment_reply_rule(payload: CommentReplyRuleCreate) -> dict:
+    require_account(payload.account_id)
+    note_info = parse_note_url(payload.note_url)
+    rule = ops_store.create_comment_reply_rule(
+        {
+            **payload.model_dump(),
+            **note_info,
+            "keywords": [item.strip() for item in payload.keywords if item.strip()],
+        }
+    )
+    return {"rule": rule}
+
+
+@app.delete("/api/comment-reply-rules/{rule_id}")
+def delete_comment_reply_rule(rule_id: str) -> dict:
+    if not ops_store.delete_comment_reply_rule(rule_id):
+        raise HTTPException(status_code=404, detail="评论回复规则不存在")
+    return {"success": True}
+
+
+@app.post("/api/comment-reply-rules/{rule_id}/run")
+def run_comment_reply_rule(rule_id: str) -> dict:
+    rule = ops_store.get_comment_reply_rule(rule_id)
+    if not rule:
+        raise HTTPException(status_code=404, detail="评论回复规则不存在")
+    result = run_comment_reply_rule_once(rule)
+    return result
+
+
 @app.get("/api/search-results")
 def list_saved_search_results(monitor_id: str | None = None) -> dict:
     return {"results": ops_store.list_search_results(monitor_id)}
@@ -953,7 +1380,7 @@ def list_analytics_snapshots(account_id: str | None = None) -> dict:
 
 @app.post("/api/analytics/snapshots")
 def create_analytics_snapshot(payload: AccountRequest) -> dict:
-    account = require_valid_account(payload.account_id)
+    account = require_valid_pc_account(payload.account_id)
     success, msg, res_json = guarded_xhs_call(payload.account_id, pc_api.get_user_self_info2, account["cookies"])
     if not success:
         success, msg, res_json = guarded_xhs_call(payload.account_id, pc_api.get_user_self_info, account["cookies"])
@@ -984,7 +1411,7 @@ def create_analytics_snapshot(payload: AccountRequest) -> dict:
 
 @app.post("/api/topics/search")
 def search_topics(payload: TopicSearchRequest) -> dict:
-    account = require_account(payload.account_id)
+    account = require_valid_creator_account(payload.account_id)
     try:
         cookies = trans_cookies(account["cookies"])
         success, msg, res_json = guarded_xhs_call(
@@ -1012,7 +1439,7 @@ def search_topics(payload: TopicSearchRequest) -> dict:
 
 @app.post("/api/profile/self")
 def get_self_profile(payload: AccountRequest) -> dict:
-    account = require_valid_account(payload.account_id)
+    account = require_valid_pc_account(payload.account_id)
     success, msg, res_json = guarded_xhs_call(payload.account_id, pc_api.get_user_self_info2, account["cookies"])
     if not success:
         success, msg, res_json = guarded_xhs_call(payload.account_id, pc_api.get_user_self_info, account["cookies"])
@@ -1024,7 +1451,7 @@ def get_self_profile(payload: AccountRequest) -> dict:
 
 @app.post("/api/profile/query")
 def query_profile(payload: ProfileQueryRequest) -> dict:
-    account = require_valid_account(payload.account_id)
+    account = require_valid_pc_account(payload.account_id)
     user_id = parse_user_id(payload.user_url_or_id)
     success, msg, res_json = guarded_xhs_call(
         payload.account_id,
@@ -1040,7 +1467,7 @@ def query_profile(payload: ProfileQueryRequest) -> dict:
 
 @app.post("/api/profile/notes")
 def get_profile_notes(payload: ProfileNotesRequest) -> dict:
-    account = require_valid_account(payload.account_id)
+    account = require_valid_pc_account(payload.account_id)
     success, msg, res_json = guarded_xhs_call(
         payload.account_id,
         pc_api.get_user_note_info,
@@ -1063,7 +1490,7 @@ def get_profile_notes(payload: ProfileNotesRequest) -> dict:
 
 @app.post("/api/search/notes")
 def search_notes(payload: SearchNotesRequest) -> dict:
-    account = require_valid_account(payload.account_id)
+    account = require_valid_pc_account(payload.account_id)
     success, msg, notes = guarded_xhs_call(
         payload.account_id,
         pc_api.search_some_note,
@@ -1082,7 +1509,7 @@ def search_notes(payload: SearchNotesRequest) -> dict:
 
 @app.post("/api/search/note-detail")
 def get_search_note_detail(payload: NoteDetailRequest) -> dict:
-    account = require_valid_account(payload.account_id)
+    account = require_valid_pc_account(payload.account_id)
     note_url = payload.note_url
     if payload.note_id and not note_url:
         note_url = build_note_url(payload.note_id, payload.xsec_token, payload.xsec_source or "pc_search")
@@ -1173,7 +1600,7 @@ async def publish_note(
     images: Annotated[list[UploadFile], File()] = [],
     video: Annotated[UploadFile | None, File()] = None,
 ) -> dict:
-    account = require_valid_account(account_id)
+    account = require_account(account_id)
 
     topic_list = parse_topics(topics)
     note_info = {
