@@ -1,380 +1,400 @@
+from __future__ import annotations
+
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
-from server.account_store import AccountStore
-from server.operation_store import OperationStore
 from server import main
-
-
-class FakeResponse:
-    ok = True
-    status_code = 200
-    text = ""
-
-    def json(self):
-        return {
-            "success": True,
-            "data": {
-                "id": "qr-1",
-                "url": "https://www.myaibot.vip/rednote/publish/qr-1",
-                "qrcode": "data:image/png;base64,abc",
-            },
-        }
-
-
-class FakePcLoginApi:
-    @staticmethod
-    def cookies_to_str(cookies):
-        return "; ".join(f"{key}={value}" for key, value in cookies.items())
-
-    def generate_init_cookies(self):
-        return {"a1": "pc-a1"}
-
-    def generate_qrcode(self, cookies):
-        return True, "成功", {
-            "cookies": cookies,
-            "qr_id": "pc-qr",
-            "code": "pc-code",
-            "qr_url": "https://login.example/pc",
-        }
-
-    def check_qrcode_status(self, qr_id, code, cookies):
-        assert qr_id == "pc-qr"
-        assert code == "pc-code"
-        cookies["web_session"] = "pc-session"
-        return True, "验证成功", cookies
-
-    def get_user_info(self, cookies):
-        return True, {"nickname": "pc-name", "red_id": "red-2"}, cookies
-
-
-class FakePcApi:
-    def get_user_self_info2(self, cookies):
-        return True, "ok", {"data": {"basic_info": {"nickname": "cookie-name"}}}
-
-
-class FakeCommentPcApi:
-    def get_user_self_info2(self, cookies):
-        return True, "ok", {"data": {"basic_info": {"nickname": "brand", "user_id": "self-user"}}}
-
-    def get_note_all_comment(self, note_url, cookies):
-        return True, "ok", [
-            {
-                "id": "comment-1",
-                "note_id": "note-1",
-                "note_url": note_url,
-                "content": "请问价格多少",
-                "user_info": {"user_id": "user-1", "nickname": "访客A"},
-                "sub_comments": [],
-            },
-            {
-                "id": "comment-2",
-                "note_id": "note-1",
-                "note_url": note_url,
-                "content": "路过看看",
-                "user_info": {"user_id": "user-2", "nickname": "访客B"},
-                "sub_comments": [],
-            },
-        ]
-
-    def post_comment(self, note_id, content, cookies, root_comment_id="", parent_comment_id="", at_users=None, proxies=None):
-        return True, "ok", {"success": True, "data": {"note_id": note_id, "content": content, "root_comment_id": root_comment_id}}
-
-    def get_unread_message(self, cookies):
-        return True, "ok", {"data": {"mention": 1, "count": 1}}
-
-    def get_all_metions(self, cookies):
-        return True, "ok", [
-            {
-                "id": "message-1",
-                "note_id": "note-1",
-                "note_url": "https://www.xiaohongshu.com/explore/note-1?xsec_token=abc",
-                "comment_id": "comment-1",
-                "content": "请问价格多少",
-                "user_info": {"user_id": "user-1", "nickname": "访客A"},
-            }
-        ]
+from server.db import configure_database, get_session_factory, init_db, utc_now
+from server.models import PublishTask, SearchTask, TaskResult
 
 
 @pytest.fixture()
-def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    account_store = AccountStore(tmp_path / "accounts.json")
-    operation_store = OperationStore(tmp_path / "operations.json")
-    monkeypatch.setattr(main, "store", account_store)
-    monkeypatch.setattr(main, "ops_store", operation_store)
-    monkeypatch.setattr(main, "login_sessions", main.LoginSessionStore())
-    main.risk_guard._cookie_cache.clear()
-    main.risk_guard._last_request_at.clear()
-    main.risk_guard._failure_count.clear()
-    main.risk_guard._cooldown_until.clear()
+def client(tmp_path: Path):
+    db_path = tmp_path / "test.db"
+    configure_database(f"sqlite:///{db_path}")
+    init_db(drop_existing=True)
     return TestClient(main.app)
 
 
-def create_account(client: TestClient) -> str:
+def create_primary_account(client: TestClient, name: str = "brand", bound_device_id: str = "") -> str:
     response = client.post(
-        "/api/accounts",
-        json={"name": "brand", "cookies": "a" * 32},
+        "/api/accounts/primary",
+        json={
+            "name": name,
+            "cookies": "a" * 32,
+            "nickname": name,
+            "bound_device_id": bound_device_id,
+            "remark": "",
+        },
     )
     assert response.status_code == 200
     return response.json()["account"]["id"]
 
 
+def create_worker_cookie(client: TestClient, name: str, tags: list[str], group_name: str = "brand_a") -> str:
+    response = client.post(
+        "/api/cookie-workers",
+        json={
+            "name": name,
+            "cookies": "b" * 32,
+            "remark": "",
+            "usage_tags": tags,
+            "group_name": group_name,
+        },
+    )
+    assert response.status_code == 200
+    return response.json()["worker_cookie"]["id"]
+
+
 def test_health(client: TestClient):
     response = client.get("/api/health")
     assert response.status_code == 200
-    assert response.json() == {"ok": True}
+    assert response.json()["ok"] is True
 
 
-def test_account_cookie_is_masked(client: TestClient):
-    account_id = create_account(client)
+def test_primary_and_worker_accounts_are_listed(client: TestClient):
+    primary_id = create_primary_account(client)
+    worker_id = create_worker_cookie(client, "worker-1", ["worker_search"])
+
     response = client.get("/api/accounts")
-    account = response.json()["accounts"][0]
-    assert account["id"] == account_id
-    assert "cookies" not in account
-    assert "..." in account["cookie_preview"]
-
-
-def test_manual_cookie_name_can_be_resolved(client: TestClient, monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(main, "pc_api", FakePcApi())
-    response = client.post("/api/accounts", json={"name": "", "cookies": "a" * 32})
-    assert response.status_code == 200
     body = response.json()
-    assert body["account"]["name"] == "cookie-name"
-    assert body["name_source"] == "pc"
-    assert "cookies" not in body["account"]
+    assert body["primary_accounts"][0]["id"] == primary_id
+    assert body["worker_cookies"][0]["id"] == worker_id
+    assert "cookies" not in body["primary_accounts"][0]
+    assert "..." in body["primary_accounts"][0]["cookie_preview"]
 
 
-def test_pc_qrcode_login_uses_code_and_saves_account(client: TestClient, monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(main, "pc_login_api", FakePcLoginApi())
-    response = client.post("/api/login/qrcode", json={"platform": "pc"})
+def test_cookie_check_updates_status(client: TestClient):
+    account_id = create_primary_account(client)
+    response = client.post(f"/api/accounts/primary/{account_id}/check")
     assert response.status_code == 200
-    qr_data = response.json()
+    assert response.json()["success"] is True
+    assert response.json()["account"]["status"] == "active"
 
+
+def test_worker_is_allocated_by_group_and_tag(client: TestClient):
+    create_worker_cookie(client, "worker-search", ["worker_search"], "brand_a")
+    create_worker_cookie(client, "worker-analytics", ["worker_analytics"], "brand_a")
     response = client.post(
-        f"/api/login/qrcode/{qr_data['session_id']}/check",
-        json={"account_name": "pc custom", "save_account": True},
+        "/api/search-tasks",
+        json={
+            "keyword": "新加坡 qt",
+            "group_name": "brand_a",
+            "require_num": 20,
+            "interval_minutes": 120,
+        },
     )
     assert response.status_code == 200
-    body = response.json()
-    assert body["status"] == "success"
-    assert body["account"]["name"] == "pc custom"
-    assert body["account"]["last_check_status"] == "valid"
+
+    response = client.get("/api/app/search-tasks/next", params={"device_id": "android-001"})
+    assert response.status_code == 200
+    task = response.json()["task"]
+    assert task["worker_cookie_id"]
 
 
-def test_qrcode_login_rejects_creator_platform(client: TestClient):
-    response = client.post("/api/login/qrcode", json={"platform": "creator"})
-    assert response.status_code == 422
-
-
-def test_publish_history_crud(client: TestClient):
-    account_id = create_account(client)
+def test_publish_task_requires_approval_before_claim(client: TestClient):
+    account_id = create_primary_account(client, bound_device_id="android-001")
     response = client.post(
         "/api/publish-tasks",
         json={
             "account_id": account_id,
-            "title": "Task",
+            "title": "Title",
             "desc": "Body",
             "topics": ["tag"],
+            "location": "",
             "media_type": "image",
-            "media_names": ["a.jpg"],
+            "media_urls": ["https://example.com/a.jpg"],
+            "review_status": "pending",
         },
     )
     assert response.status_code == 200
     task_id = response.json()["task"]["id"]
 
-    response = client.get("/api/publish-tasks")
-    assert len(response.json()["tasks"]) == 1
-    response = client.get("/api/publish-history")
-    assert len(response.json()["items"]) == 1
-
-    response = client.delete(f"/api/publish-tasks/{task_id}")
+    response = client.get("/api/app/publish-tasks/next", params={"device_id": "android-001"})
     assert response.status_code == 200
-    assert client.get("/api/publish-tasks").json()["tasks"] == []
+    assert response.json()["task"] is None
 
-
-def test_search_monitor_crud(client: TestClient):
-    account_id = create_account(client)
-    response = client.post(
-        "/api/search-monitors",
-        json={"account_id": account_id, "keyword": "新加坡 qt", "require_num": 10},
-    )
-    assert response.status_code == 200
-    monitor_id = response.json()["monitor"]["id"]
-
-    response = client.get("/api/search-monitors")
-    assert response.json()["monitors"][0]["keyword"] == "新加坡 qt"
-
-    response = client.delete(f"/api/search-monitors/{monitor_id}")
+    response = client.patch(f"/api/publish-tasks/{task_id}", json={"review_status": "approved"})
     assert response.status_code == 200
 
+    response = client.get("/api/app/publish-tasks/next", params={"device_id": "android-001"})
+    assert response.status_code == 200
+    assert response.json()["task"]["id"] == task_id
 
-def test_search_monitor_rejects_too_short_interval(client: TestClient):
-    account_id = create_account(client)
+
+def test_same_device_cannot_claim_multiple_tasks(client: TestClient):
+    create_worker_cookie(client, "worker-search", ["worker_search"])
+    client.post("/api/search-tasks", json={"keyword": "A", "group_name": "brand_a"})
+    client.post("/api/search-tasks", json={"keyword": "B", "group_name": "brand_a"})
+
+    response = client.get("/api/app/search-tasks/next", params={"device_id": "android-001"})
+    assert response.status_code == 200
+    assert response.json()["task"] is not None
+
+    response = client.get("/api/app/search-tasks/next", params={"device_id": "android-001"})
+    assert response.status_code == 409
+
+
+def test_publish_result_is_idempotent(client: TestClient):
+    account_id = create_primary_account(client, bound_device_id="android-001")
     response = client.post(
-        "/api/search-monitors",
-        json={"account_id": account_id, "keyword": "新加坡 qt", "require_num": 10, "interval_minutes": 2},
-    )
-    assert response.status_code == 422
-    detail = response.json()["detail"]
-    assert detail[0]["loc"][-1] == "interval_minutes"
-
-
-def test_comment_reply_rule_crud_and_run(client: TestClient, monkeypatch: pytest.MonkeyPatch):
-    account_id = create_account(client)
-    main.risk_guard.set_cookie_cache(account_id, True, "Cookie 可用")
-    monkeypatch.setattr(main, "pc_api", FakeCommentPcApi())
-
-    response = client.post(
-        "/api/comment-reply-rules",
+        "/api/publish-tasks",
         json={
             "account_id": account_id,
-            "note_url": "https://www.xiaohongshu.com/explore/note-1?xsec_token=abc&xsec_source=pc_search",
-            "keywords": ["价格", "多少钱"],
-            "reply_text": "你好，{nickname}，这边私信你报价。",
-            "max_replies_per_run": 2,
-        },
-    )
-    assert response.status_code == 200
-    rule = response.json()["rule"]
-    assert rule["note_id"] == "note-1"
-    assert rule["xsec_token"] == "abc"
-
-    response = client.post(f"/api/comment-reply-rules/{rule['id']}/run")
-    assert response.status_code == 200
-    body = response.json()
-    assert len(body["matched"]) == 1
-    assert len(body["sent"]) == 1
-    assert body["failed"] == []
-
-    records = client.get("/api/comment-reply-records").json()["records"]
-    assert len(records) == 1
-    assert records[0]["comment_id"] == "comment-1"
-    assert "访客A" in records[0]["reply_text"]
-
-    response = client.post(f"/api/comment-reply-rules/{rule['id']}/run")
-    assert response.status_code == 200
-    assert response.json()["sent"] == []
-
-    response = client.delete(f"/api/comment-reply-rules/{rule['id']}")
-    assert response.status_code == 200
-
-
-def test_comment_inbox_load_and_reply(client: TestClient, monkeypatch: pytest.MonkeyPatch):
-    account_id = create_account(client)
-    main.risk_guard.set_cookie_cache(main.cookie_cache_key(account_id, "pc"), True, "Cookie 可用")
-    monkeypatch.setattr(main, "pc_api", FakeCommentPcApi())
-
-    response = client.post("/api/comment-inbox", json={"account_id": account_id})
-    assert response.status_code == 200
-    body = response.json()
-    assert len(body["messages"]) == 1
-    assert body["messages"][0]["comment_id"] == "comment-1"
-
-    response = client.post(
-        "/api/comment-inbox/reply",
-        json={
-            "account_id": account_id,
-            "note_id": "note-1",
-            "note_url": "https://www.xiaohongshu.com/explore/note-1?xsec_token=abc",
-            "message_id": "message-1",
-            "comment_id": "comment-1",
-            "comment_user_id": "user-1",
-            "comment_nickname": "访客A",
-            "comment_content": "请问价格多少",
-            "reply_text": "你好，这边回复你。",
-        },
-    )
-    assert response.status_code == 200
-    record = response.json()["record"]
-    assert record["source"] == "inbox"
-    assert record["message_id"] == "message-1"
-
-
-def test_search_results_are_deduped_by_note_id(tmp_path: Path):
-    operation_store = OperationStore(tmp_path / "operations.json")
-    note = {
-        "note_id": "note-1",
-        "note_url": "https://www.xiaohongshu.com/explore/note-1?xsec_token=a",
-        "xsec_token": "a",
-        "title": "Title",
-    }
-    duplicate = {
-        **note,
-        "note_url": "https://www.xiaohongshu.com/explore/note-1?xsec_token=b",
-        "xsec_token": "b",
-    }
-
-    saved = operation_store.save_search_results("monitor-1", "新加坡 qt", [note, duplicate])
-    assert len(saved) == 1
-    saved_again = operation_store.save_search_results("monitor-1", "新加坡 qt", [duplicate])
-    assert saved_again == []
-    assert len(operation_store.list_search_results("monitor-1")) == 1
-
-
-def test_invalid_empty_search_note_is_filtered():
-    invalid = {
-        "note_id": "bad-note",
-        "note_url": "https://www.xiaohongshu.com/explore/bad-note",
-        "title": "无标题",
-        "nickname": "",
-        "cover": "",
-    }
-    valid = {
-        "note_id": "good-note",
-        "note_url": "https://www.xiaohongshu.com/explore/good-note",
-        "title": "真实标题",
-        "nickname": "",
-        "cover": "",
-    }
-    assert main.is_useful_note(invalid) is False
-    assert main.is_useful_note(valid) is True
-
-
-def test_external_publish_config_masks_api_key(client: TestClient):
-    response = client.post(
-        "/api/external-publish/config",
-        json={"api_key": "sk_test_1234567890"},
-    )
-    assert response.status_code == 200
-    config = response.json()["config"]
-    assert config["has_api_key"] is True
-    assert config["api_key"] == ""
-    assert config["api_key_preview"].startswith("sk_t")
-
-
-def test_external_publish_validation_requires_media(client: TestClient):
-    client.post("/api/external-publish/config", json={"api_key": "sk_test_1234567890"})
-    response = client.post(
-        "/api/external-publish/qrcode",
-        json={"type": "normal", "title": "No image", "content": "Body", "images": []},
-    )
-    assert response.status_code == 400
-    assert "图片" in response.json()["detail"]
-
-
-def test_external_publish_qrcode_uses_mocked_provider(client: TestClient, monkeypatch: pytest.MonkeyPatch):
-    account_id = create_account(client)
-    client.post("/api/external-publish/config", json={"api_key": "sk_test_1234567890"})
-    monkeypatch.setattr(main.requests, "post", lambda *args, **kwargs: FakeResponse())
-
-    response = client.post(
-        "/api/external-publish/qrcode",
-        json={
-            "account_id": account_id,
-            "type": "normal",
             "title": "Title",
-            "content": "Body #tag",
-            "images": ["https://example.com/a.jpg"],
+            "desc": "Body",
+            "media_type": "image",
+            "media_urls": ["https://example.com/a.jpg"],
+            "review_status": "approved",
+        },
+    )
+    task_id = response.json()["task"]["id"]
+    claim = client.get("/api/app/publish-tasks/next", params={"device_id": "android-001"})
+    assert claim.status_code == 200
+
+    payload = {
+        "device_id": "android-001",
+        "app_instance_id": "app-1",
+        "result_id": "result-1",
+        "status": "published",
+        "post_id": "post-1",
+        "post_url": "https://www.xiaohongshu.com/explore/post-1",
+        "error_message": "",
+        "duration_seconds": 12,
+    }
+    first = client.post(f"/api/app/publish-tasks/{task_id}/result", json=payload)
+    second = client.post(f"/api/app/publish-tasks/{task_id}/result", json=payload)
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["created"] is True
+    assert second.json()["created"] is False
+
+    with get_session_factory()() as session:
+        count = session.execute(select(TaskResult).where(TaskResult.task_id == task_id)).scalars().all()
+        assert len(count) == 1
+
+
+def test_unified_app_task_claim_and_result(client: TestClient):
+    account_id = create_primary_account(client, bound_device_id="android-001")
+    response = client.post(
+        "/api/publish-tasks",
+        json={
+            "account_id": account_id,
+            "title": "Unified",
+            "desc": "Body",
+            "media_type": "image",
+            "media_urls": ["https://example.com/a.jpg"],
+            "review_status": "approved",
+        },
+    )
+    task_id = response.json()["task"]["id"]
+
+    claim = client.get(
+        "/api/app/tasks/next",
+        params={
+            "device_id": "android-001",
+            "app_instance_id": "app-1",
+            "app_version": "1.0.0",
+            "device_name": "Pixel",
+        },
+    )
+    assert claim.status_code == 200
+    assert claim.json()["task_type"] == "publish"
+    assert claim.json()["task"]["id"] == task_id
+
+    result = client.post(
+        f"/api/app/tasks/publish/{task_id}/result",
+        json={
+            "device_id": "android-001",
+            "app_instance_id": "app-1",
+            "result_id": "unified-result-1",
+            "status": "published",
+            "post_id": "post-1",
+            "post_url": "https://www.xiaohongshu.com/explore/post-1",
+            "error_message": "",
+            "duration_seconds": 10,
+        },
+    )
+    assert result.status_code == 200
+    assert result.json()["created"] is True
+    assert result.json()["task"]["task_status"] == "success"
+
+
+def test_requeue_publish_task(client: TestClient):
+    account_id = create_primary_account(client)
+    response = client.post(
+        "/api/publish-tasks",
+        json={
+            "account_id": account_id,
+            "title": "Requeue",
+            "desc": "Body",
+            "media_type": "image",
+            "media_urls": ["https://example.com/a.jpg"],
+            "review_status": "approved",
+        },
+    )
+    task_id = response.json()["task"]["id"]
+    client.patch(f"/api/publish-tasks/{task_id}", json={"task_status": "cancelled"})
+
+    response = client.post(f"/api/publish-tasks/{task_id}/requeue")
+    assert response.status_code == 200
+    body = response.json()["task"]
+    assert body["task_status"] == "pending"
+    assert body["claim_expires_at"] is None
+
+
+def test_claim_timeout_is_reclaimed(client: TestClient):
+    create_worker_cookie(client, "worker-search", ["worker_search"])
+    response = client.post("/api/search-tasks", json={"keyword": "A", "group_name": "brand_a"})
+    task_id = response.json()["task"]["id"]
+    response = client.get("/api/app/search-tasks/next", params={"device_id": "android-001"})
+    assert response.status_code == 200
+    assert response.json()["task"]["id"] == task_id
+
+    with get_session_factory()() as session:
+        task = session.get(SearchTask, task_id)
+        assert task is not None
+        task.claim_expires_at = utc_now() - timedelta(minutes=1)
+        session.commit()
+
+    response = client.get("/api/app/search-tasks/next", params={"device_id": "android-002"})
+    assert response.status_code == 200
+    assert response.json()["task"]["id"] == task_id
+
+
+def test_search_result_is_saved_and_deduped(client: TestClient):
+    worker_id = create_worker_cookie(client, "worker-search", ["worker_search"])
+    response = client.post("/api/search-tasks", json={"keyword": "A", "group_name": "brand_a"})
+    task_id = response.json()["task"]["id"]
+    claim = client.get("/api/app/search-tasks/next", params={"device_id": "android-001"})
+    assert claim.status_code == 200
+
+    payload = {
+        "device_id": "android-001",
+        "app_instance_id": "app-1",
+        "result_id": "search-result-1",
+        "worker_cookie_id": worker_id,
+        "partial_success": False,
+        "items": [
+            {
+                "post_id": "note-1",
+                "post_url": "https://www.xiaohongshu.com/explore/note-1",
+                "title": "Title",
+                "username": "作者",
+                "user_id": "user-1",
+                "content_preview": "正文摘要",
+                "like_count": 1,
+                "comment_count": 2,
+                "collect_count": 3,
+            },
+            {
+                "post_id": "note-1",
+                "post_url": "https://www.xiaohongshu.com/explore/note-1",
+                "title": "Title",
+                "username": "作者",
+                "user_id": "user-1",
+                "content_preview": "正文摘要",
+                "like_count": 1,
+                "comment_count": 2,
+                "collect_count": 3,
+            },
+        ],
+        "error_message": "",
+        "duration_seconds": 5,
+    }
+    response = client.post(f"/api/app/search-tasks/{task_id}/result", json=payload)
+    assert response.status_code == 200
+    assert response.json()["saved_count"] == 1
+
+    response = client.get("/api/search-results", params={"task_id": task_id})
+    assert response.status_code == 200
+    assert len(response.json()["results"]) == 1
+    result_id = response.json()["results"][0]["id"]
+
+    response = client.patch(f"/api/search-results/{result_id}", json={"review_status": "valid", "hidden": True})
+    assert response.status_code == 200
+    assert response.json()["result"]["review_status"] == "valid"
+    assert response.json()["result"]["hidden"] is True
+
+
+def test_device_can_be_disabled(client: TestClient):
+    response = client.post(
+        "/api/app/heartbeat",
+        json={
+            "device_id": "android-001",
+            "app_instance_id": "app-1",
+            "app_version": "1.0.0",
+            "device_name": "Pixel",
         },
     )
     assert response.status_code == 200
-    assert response.json()["result"]["qrcode"].startswith("data:image/png")
-    records = client.get("/api/external-publish/records").json()["records"]
-    assert len(records) == 1
-    tasks = client.get("/api/publish-tasks").json()["tasks"]
-    assert len(tasks) == 1
-    assert tasks[0]["status"] == "published"
-    assert tasks[0]["topics"] == ["tag"]
-    assert tasks[0]["media_names"] == ["https://example.com/a.jpg"]
+    device_id = response.json()["device"]["id"]
+
+    response = client.patch(f"/api/devices/{device_id}", json={"status": "disabled"})
+    assert response.status_code == 200
+    assert response.json()["device"]["status"] == "disabled"
+
+    response = client.get("/api/app/tasks/next", params={"device_id": "android-001", "app_instance_id": "app-1"})
+    assert response.status_code == 403
+
+
+def test_analytics_snapshot_is_saved(client: TestClient):
+    account_id = create_primary_account(client)
+    worker_id = create_worker_cookie(client, "worker-analytics", ["worker_analytics"])
+    response = client.post("/api/analytics-tasks", json={"account_id": account_id, "group_name": "brand_a"})
+    task_id = response.json()["task"]["id"]
+    claim = client.get("/api/app/analytics-tasks/next", params={"device_id": "android-001"})
+    assert claim.status_code == 200
+    assert claim.json()["task"]["id"] == task_id
+
+    payload = {
+        "device_id": "android-001",
+        "app_instance_id": "app-1",
+        "result_id": "analytics-result-1",
+        "worker_cookie_id": worker_id,
+        "snapshot": {
+            "account_id": account_id,
+            "nickname": "品牌号",
+            "follower_count": 120,
+            "liked_count": 888,
+            "post_count": 3,
+            "collected_total": 12,
+            "posts": [
+                {
+                    "post_id": "p-1",
+                    "title": "帖子一",
+                    "post_url": "https://www.xiaohongshu.com/explore/p-1",
+                    "like_count": 1,
+                    "comment_count": 2,
+                    "collect_count": 3,
+                }
+            ],
+        },
+        "error_message": "",
+        "duration_seconds": 8,
+    }
+    response = client.post(f"/api/app/analytics-tasks/{task_id}/result", json=payload)
+    assert response.status_code == 200
+    assert response.json()["created"] is True
+
+    response = client.get("/api/analytics-snapshots", params={"account_id": account_id})
+    assert response.status_code == 200
+    snapshots = response.json()["snapshots"]
+    assert len(snapshots) == 1
+    assert snapshots[0]["nickname"] == "品牌号"
+    assert snapshots[0]["posts"][0]["post_id"] == "p-1"
+
+
+def test_summary_uses_database_aggregates(client: TestClient):
+    create_primary_account(client)
+    create_worker_cookie(client, "worker-search", ["worker_search"])
+    response = client.get("/api/ops/summary")
+    assert response.status_code == 200
+    summary = response.json()["summary"]
+    assert summary["primary_account_total"] == 1
+    assert summary["worker_cookie_total"] == 1
+    assert "latest_logs" in summary

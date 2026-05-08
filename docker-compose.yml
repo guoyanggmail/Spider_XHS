@@ -1,4 +1,22 @@
 services:
+  postgres:
+    image: postgres:16
+    container_name: spider-xhs-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: spider_xhs
+      POSTGRES_USER: spider_xhs
+      POSTGRES_PASSWORD: spider_xhs
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U spider_xhs -d spider_xhs"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
   xhs-web:
     build:
       context: .
@@ -16,5 +34,16 @@ services:
       XHS_WEB_HOST: 0.0.0.0
       XHS_WEB_PORT: 8000
       XHS_USE_PROXY: "0"
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: spider_xhs
+      POSTGRES_USER: spider_xhs
+      POSTGRES_PASSWORD: spider_xhs
+    depends_on:
+      postgres:
+        condition: service_healthy
     volumes:
       - ./datas:/app/datas
+
+volumes:
+  postgres-data:

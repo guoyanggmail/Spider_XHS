@@ -4,8 +4,18 @@
 
 - 后端：Python 3.10、FastAPI、Uvicorn、Pydantic、PyExecJS
 - 前端：React、TypeScript、Vite、Tailwind CSS、shadcn/ui 配置体系、lucide-react
-- 存储：本地 JSON 文件
+- 数据库：PostgreSQL 16
 - 容器：Docker、Docker Compose，运行镜像内包含 Node.js 和根目录 npm 依赖，供 PyExecJS 执行小红书签名 JS
+
+## 当前部署定位
+
+当前项目部署的是：
+
+- Web 管理后台
+- App 对接后端
+- PostgreSQL 数据库存储
+
+当前项目不负责部署 Android 自动化执行端。Android App 会在独立项目中实现，并通过本项目提供的接口通信。
 
 ## 本地开发运行
 
@@ -60,6 +70,13 @@ sh scripts/check.sh
 
 ## Docker 一键部署
 
+`docker-compose.yml` 会同时启动：
+
+| 服务 | 端口 | 说明 |
+|---|---:|---|
+| `postgres` | `5432` | PostgreSQL 16，使用 `postgres-data` 数据卷 |
+| `xhs-web` | `8000` | FastAPI 后端和已构建的 Web 管理台 |
+
 构建并启动：
 
 ```bash
@@ -90,6 +107,26 @@ docker compose down
 sh scripts/docker-down.sh
 ```
 
+查看服务状态：
+
+```bash
+docker compose ps
+```
+
+查看后端日志：
+
+```bash
+docker compose logs -f xhs-web
+```
+
+执行数据库迁移：
+
+```bash
+docker compose exec xhs-web alembic upgrade head
+```
+
+当前后端启动时也会自动创建缺失表；生产环境变更表结构时仍建议显式执行 Alembic 迁移。
+
 ## Docker 国内源
 
 Dockerfile 默认使用国内依赖源加速构建：
@@ -113,19 +150,36 @@ docker compose build
 
 ## 数据持久化
 
-Docker Compose 会把本地 `./datas` 挂载到容器 `/app/datas`。
+Docker 部署默认使用 PostgreSQL 数据卷持久化数据库文件。
 
-主要本地数据：
+```text
+postgres-data -> /var/lib/postgresql/data
+```
 
-- `datas/accounts.json`：账号 Cookie，本地明文保存，不要提交。
-- `datas/operations.json`：运营任务、监控结果、账号快照、第三方发布 API Key 和操作日志，不要提交。
+迁移完成后：
+
+- `datas/accounts.json` 不再作为主存储。
+- `datas/operations.json` 不再作为主存储。
+- `datas/` 可仅保留导入导出或临时调试用途。
+
+如需导入旧 JSON 数据：
+
+```bash
+docker compose exec xhs-web python scripts/import_json_to_db.py
+```
 
 ## 环境变量
 
 - `XHS_WEB_HOST`：服务监听地址，Docker 默认 `0.0.0.0`。
 - `XHS_WEB_PORT`：服务端口，Docker 默认 `8000`。
 - `XHS_USE_PROXY`：是否保留系统代理。默认 `0`，后端会清理代理环境变量。
+- `POSTGRES_HOST`：PostgreSQL 主机。
+- `POSTGRES_PORT`：PostgreSQL 端口。
+- `POSTGRES_DB`：数据库名。
+- `POSTGRES_USER`：数据库用户。
+- `POSTGRES_PASSWORD`：数据库密码。
+- `DATABASE_URL`：完整数据库连接串。设置后优先级高于 `POSTGRES_*`。
 
 ## 注意
 
-Docker 部署仍建议只在本机或可信内网使用，不建议暴露到公网。Cookie 是敏感信息，当前版本不做加密存储。
+Docker 部署仍建议只在本机或可信内网使用，不建议暴露到公网。Cookie 是敏感信息，数据库中的 Cookie 字段不能向前端透出。

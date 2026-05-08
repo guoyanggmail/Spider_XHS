@@ -26,9 +26,15 @@
 
 ---
 
-## Spider XHS Web 运营后台
+## Spider XHS 管理后台
 
-本项目当前扩展了本地 Web 版小红书运营后台，支持多账号管理、内容发布、发布任务、关键词查询/监控、主页查询、账号分析快照和 Docker 一键部署。
+本项目当前扩展为本地管理后台与接口服务，定位是给独立的 App 自动化项目提供账号管理、任务管理、结果查询和风控能力。
+
+当前方向：
+
+- App 端负责登录、发帖、关键词采集和账号数据采集
+- Web 页面只做管理系统
+- 本仓库负责后端接口、数据存储、Cookie 管理和风控
 
 ### Web 快速启动
 
@@ -62,6 +68,9 @@ http://127.0.0.1:5173/
 ### Web 运营后台文档
 
 - [需求文档](docs/REQUIREMENTS.md)
+- [技术方案](docs/TECHNICAL_DESIGN.md)
+- [数据库设计](docs/DB_DESIGN.md)
+- [后台接口设计](docs/API_SPEC.md)
 - [项目状态](docs/PROJECT_STATUS.md)
 - [部署文档](docs/DEPLOYMENT.md)
 - [自动化测试](docs/TESTING.md)

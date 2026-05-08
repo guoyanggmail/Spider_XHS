@@ -42,3 +42,8 @@ datas/accounts.json
 datas/accounts.tmp
 datas/operations.json
 datas/operations.tmp
+datas/*.db
+android/.gradle/
+android/.idea/
+android/local.properties
+android/**/build/

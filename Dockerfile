@@ -50,7 +50,9 @@ COPY server ./server
 COPY static ./static
 COPY xhs_utils ./xhs_utils
 COPY spider ./spider
-COPY RISK_CONTROL.md README.md ./
+COPY alembic ./alembic
+COPY scripts ./scripts
+COPY alembic.ini RISK_CONTROL.md README.md ./
 COPY --from=frontend-builder /app/frontend/dist ./frontend/dist
 
 RUN mkdir -p /app/datas

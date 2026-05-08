@@ -12,5 +12,8 @@ fastapi
 uvicorn
 python-multipart
 pydantic
+sqlalchemy
+alembic
+psycopg[binary]
 pytest
 httpx

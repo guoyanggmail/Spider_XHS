@@ -1,33 +1,59 @@
-import json
+from __future__ import annotations
+
 import os
-import random
-import re
-import threading
-import time
-from base64 import b64encode
-from io import BytesIO
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Annotated, Literal
-from urllib.parse import urlencode, urlparse
+from typing import Literal
 
-import qrcode
-import qrcode.image.svg
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
-import requests
+from pydantic import BaseModel, Field, ValidationError
+from sqlalchemy import func, or_, select
+from sqlalchemy.orm import Session, selectinload
 
-from apis.xhs_creator_apis import XHS_Creator_Apis
-from apis.xhs_creator_login_apis import XHSCreatorLoginApi
-from apis.xhs_pc_apis import XHS_Apis
-from apis.xhs_pc_login_apis import XHSLoginApi
-from server.account_store import AccountStore
-from server.operation_store import OperationStore
-from xhs_utils.data_util import handle_note_info
-from xhs_utils.http_util import REQUEST_TIMEOUT
-from xhs_utils.cookie_util import trans_cookies
+from server.db import get_database_url, get_db, init_db
+from server.models import (
+    Account,
+    AccountUsageTag,
+    AnalyticsSnapshot,
+    AnalyticsSnapshotPost,
+    AnalyticsTask,
+    AuditLog,
+    Device,
+    PublishTask,
+    SearchResult,
+    SearchTask,
+    TaskResult,
+)
+
+
+COOKIE_CHECK_TTL_SECONDS = 600
+FAILURE_COOLDOWN_THRESHOLD = 3
+FAILURE_COOLDOWN_SECONDS = 300
+CLAIM_TIMEOUT_MINUTES = 15
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+FRONTEND_DIST = ROOT_DIR / "frontend" / "dist"
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def mask_cookie(cookies: str) -> str:
+    if not cookies:
+        return ""
+    if len(cookies) <= 16:
+        return "*" * len(cookies)
+    return f"{cookies[:8]}...{cookies[-8:]}"
+
+
+def normalize_status(status: str, allowed: set[str], default: str) -> str:
+    value = (status or "").strip()
+    return value if value in allowed else default
 
 
 def disable_proxy_for_xhs() -> None:
@@ -35,150 +61,18 @@ def disable_proxy_for_xhs() -> None:
         return
     for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
         os.environ.pop(key, None)
-    no_proxy_hosts = [
-        "creator.xiaohongshu.com",
-        "edith.xiaohongshu.com",
-        "www.xiaohongshu.com",
-        "ros-upload.xiaohongshu.com",
-        "as.xiaohongshu.com",
-        ".xiaohongshu.com",
-        ".xhscdn.com",
-    ]
-    current_no_proxy = os.getenv("NO_PROXY") or os.getenv("no_proxy") or ""
-    merged_hosts = [host for host in current_no_proxy.split(",") if host.strip()]
-    for host in no_proxy_hosts:
-        if host not in merged_hosts:
-            merged_hosts.append(host)
-    no_proxy = ",".join(merged_hosts)
-    os.environ["NO_PROXY"] = no_proxy
-    os.environ["no_proxy"] = no_proxy
 
 
 disable_proxy_for_xhs()
 
-app = FastAPI(title="Spider XHS Web Publisher")
-store = AccountStore()
-ops_store = OperationStore()
-creator_api = XHS_Creator_Apis()
-pc_api = XHS_Apis()
-pc_login_api = XHSLoginApi()
-creator_login_api = XHSCreatorLoginApi()
 
-COOKIE_CHECK_TTL_SECONDS = 600
-REQUEST_INTERVAL_RANGE_SECONDS = (2.0, 6.0)
-FAILURE_COOLDOWN_THRESHOLD = 3
-FAILURE_COOLDOWN_SECONDS = 300
-LOGIN_SESSION_TTL_SECONDS = 180
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    init_db()
+    yield
 
 
-class RiskGuard:
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._last_request_at: dict[str, float] = {}
-        self._failure_count: dict[str, int] = {}
-        self._cooldown_until: dict[str, float] = {}
-        self._cookie_cache: dict[str, tuple[float, bool, str]] = {}
-
-    def before_request(self, account_id: str) -> None:
-        now = time.time()
-        with self._lock:
-            cooldown_until = self._cooldown_until.get(account_id, 0)
-            if cooldown_until > now:
-                remaining = int(cooldown_until - now)
-                raise HTTPException(status_code=429, detail=f"账号请求已冷却，请 {remaining} 秒后重试")
-
-            last_request_at = self._last_request_at.get(account_id)
-            delay = 0.0
-            if last_request_at is not None:
-                next_request_at = last_request_at + random.uniform(*REQUEST_INTERVAL_RANGE_SECONDS)
-                delay = max(0.0, next_request_at - now)
-            self._last_request_at[account_id] = now + delay
-
-        if delay > 0:
-            time.sleep(delay)
-
-    def record_result(self, account_id: str, success: bool, msg: str = "") -> None:
-        with self._lock:
-            if success:
-                self._failure_count[account_id] = 0
-                return
-            failures = self._failure_count.get(account_id, 0) + 1
-            self._failure_count[account_id] = failures
-            if failures >= FAILURE_COOLDOWN_THRESHOLD:
-                self._cooldown_until[account_id] = time.time() + FAILURE_COOLDOWN_SECONDS
-
-    def get_cookie_cache(self, account_id: str) -> tuple[bool, str] | None:
-        cached = self._cookie_cache.get(account_id)
-        if not cached:
-            return None
-        checked_at, is_valid, msg = cached
-        if time.time() - checked_at > COOKIE_CHECK_TTL_SECONDS:
-            return None
-        return is_valid, msg
-
-    def set_cookie_cache(self, account_id: str, is_valid: bool, msg: str) -> None:
-        self._cookie_cache[account_id] = (time.time(), is_valid, msg)
-
-    def clear_cookie_cache(self, account_id: str) -> None:
-        self._cookie_cache.pop(account_id, None)
-
-
-risk_guard = RiskGuard()
-
-
-class LoginSessionStore:
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._sessions: dict[str, dict] = {}
-
-    def create(self, platform: str, cookies: dict, qr_id: str, qr_url: str, code: str = "") -> dict:
-        session_id = f"{int(time.time() * 1000)}-{random.randint(100000, 999999)}"
-        session = {
-            "id": session_id,
-            "platform": platform,
-            "cookies": cookies,
-            "qr_id": qr_id,
-            "qr_url": qr_url,
-            "code": code,
-            "created_at": time.time(),
-            "last_check_at": 0.0,
-            "last_status": "pending",
-            "last_msg": "二维码已生成",
-        }
-        with self._lock:
-            self._cleanup_locked()
-            self._sessions[session_id] = session
-        return session
-
-    def get(self, session_id: str) -> dict | None:
-        with self._lock:
-            self._cleanup_locked()
-            session = self._sessions.get(session_id)
-            return dict(session) if session else None
-
-    def update(self, session_id: str, **kwargs) -> None:
-        with self._lock:
-            if session_id in self._sessions:
-                self._sessions[session_id].update(kwargs)
-
-    def delete(self, session_id: str) -> None:
-        with self._lock:
-            self._sessions.pop(session_id, None)
-
-    def _cleanup_locked(self) -> None:
-        now = time.time()
-        expired = [
-            session_id
-            for session_id, session in self._sessions.items()
-            if now - session["created_at"] > LOGIN_SESSION_TTL_SECONDS
-        ]
-        for session_id in expired:
-            self._sessions.pop(session_id, None)
-
-
-login_sessions = LoginSessionStore()
-ROOT_DIR = Path(__file__).resolve().parents[1]
-FRONTEND_DIST = ROOT_DIR / "frontend" / "dist"
+app = FastAPI(title="Spider XHS Management Backend", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -192,1470 +86,1611 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-class AccountCreate(BaseModel):
-    name: str = Field(default="", max_length=80)
+class PrimaryAccountCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
     cookies: str = Field(min_length=20)
+    nickname: str = Field(default="", max_length=100)
+    bound_device_id: str = Field(default="", max_length=100)
+    remark: str = Field(default="", max_length=500)
 
 
-class LoginQrCreate(BaseModel):
-    platform: Literal["pc"] = "pc"
-
-
-class LoginQrCheck(BaseModel):
-    account_name: str = Field(default="", max_length=80)
-    save_account: bool = True
-
-
-class TopicSearchRequest(BaseModel):
+class PrimaryCookieSync(BaseModel):
     account_id: str
-    keyword: str = Field(min_length=1, max_length=80)
+    cookies: str = Field(min_length=20)
+    source: str = Field(default="android_app", max_length=50)
 
 
-class AccountRequest(BaseModel):
-    account_id: str
+class WorkerCookieCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    cookies: str = Field(min_length=20)
+    remark: str = Field(default="", max_length=500)
+    usage_tags: list[str] = Field(default_factory=list)
+    group_name: str = Field(default="", max_length=100)
 
 
-class ProfileQueryRequest(BaseModel):
-    account_id: str
-    user_url_or_id: str = Field(min_length=1, max_length=300)
-
-
-class SearchNotesRequest(BaseModel):
-    account_id: str
-    query: str = Field(min_length=1, max_length=80)
-    require_num: int = Field(default=10, ge=1, le=100)
-    sort_type_choice: int = Field(default=0, ge=0, le=4)
-    note_type: int = Field(default=0, ge=0, le=2)
-    note_time: int = Field(default=0, ge=0, le=3)
-
-
-class NoteDetailRequest(BaseModel):
-    account_id: str
-    note_url: str = Field(min_length=20, max_length=500)
-    note_id: str = Field(default="", max_length=80)
-    xsec_token: str = Field(default="", max_length=300)
-    xsec_source: str = Field(default="pc_search", max_length=80)
-
-
-class ProfileNotesRequest(BaseModel):
-    account_id: str
-    user_id: str = Field(min_length=1, max_length=80)
-    cursor: str = Field(default="", max_length=200)
-    xsec_token: str = Field(default="", max_length=300)
-    xsec_source: str = Field(default="pc_user", max_length=80)
+class WorkerCookieUpdate(BaseModel):
+    status: str | None = Field(default=None, max_length=20)
+    remark: str | None = Field(default=None, max_length=500)
+    usage_tags: list[str] | None = None
+    group_name: str | None = Field(default=None, max_length=100)
 
 
 class PublishTaskCreate(BaseModel):
     account_id: str
-    title: str = Field(min_length=1, max_length=60)
-    desc: str = ""
-    topics: list[str] = []
-    location: str = ""
-    privacy_type: int = Field(default=1, ge=0, le=1)
-    media_type: str = Field(default="image")
-    media_names: list[str] = []
-    scheduled_date: str = ""
-    status: str = Field(default="pending")
+    title: str = Field(min_length=1, max_length=120)
+    desc: str = Field(default="", max_length=5000)
+    topics: list[str] = Field(default_factory=list)
+    location: str = Field(default="", max_length=120)
+    media_type: Literal["image", "video"] = "image"
+    media_urls: list[str] = Field(default_factory=list)
+    cover_url: str = Field(default="", max_length=1000)
+    scheduled_at: datetime | None = None
+    review_status: Literal["pending", "approved", "rejected"] = "pending"
+    max_retry: int = Field(default=1, ge=0, le=5)
 
 
-class TaskStatusUpdate(BaseModel):
-    status: str = Field(pattern="^(draft|pending|published|failed|cancelled)$")
-    last_error: str = ""
+class PublishTaskUpdate(BaseModel):
+    review_status: Literal["pending", "approved", "rejected"] | None = None
+    task_status: Literal["pending", "cancelled"] | None = None
+    remark: str = Field(default="", max_length=500)
 
 
-class SearchMonitorCreate(BaseModel):
-    account_id: str
-    keyword: str = Field(min_length=1, max_length=80)
-    require_num: int = Field(default=10, ge=1, le=50)
-    sort_type_choice: int = Field(default=0, ge=0, le=4)
-    note_type: int = Field(default=0, ge=0, le=2)
-    note_time: int = Field(default=0, ge=0, le=3)
-    interval_minutes: int = Field(default=60, ge=5, le=1440)
+class SearchTaskCreate(BaseModel):
+    keyword: str = Field(min_length=1, max_length=200)
+    interval_minutes: int = Field(default=120, ge=5, le=1440)
+    require_num: int = Field(default=10, ge=1, le=100)
+    sort_type: str = Field(default="general", max_length=30)
+    note_type: str = Field(default="all", max_length=30)
+    time_range: str = Field(default="all", max_length=30)
     enabled: bool = True
+    group_name: str = Field(default="", max_length=100)
+    max_retry: int = Field(default=1, ge=0, le=5)
 
 
-class CommentReplyRuleCreate(BaseModel):
+class SearchTaskUpdate(BaseModel):
+    enabled: bool | None = None
+    group_name: str | None = Field(default=None, max_length=100)
+    require_num: int | None = Field(default=None, ge=1, le=100)
+    interval_minutes: int | None = Field(default=None, ge=5, le=1440)
+
+
+class AnalyticsTaskCreate(BaseModel):
     account_id: str
-    note_url: str = Field(min_length=20, max_length=500)
-    keywords: list[str] = []
-    reply_text: str = Field(min_length=1, max_length=300)
-    max_replies_per_run: int = Field(default=3, ge=1, le=20)
+    interval_minutes: int = Field(default=360, ge=360, le=10080)
     enabled: bool = True
+    group_name: str = Field(default="", max_length=100)
+    max_retry: int = Field(default=1, ge=0, le=5)
 
 
-class CommentInboxRequest(BaseModel):
+class AnalyticsTaskUpdate(BaseModel):
+    enabled: bool | None = None
+    group_name: str | None = Field(default=None, max_length=100)
+    interval_minutes: int | None = Field(default=None, ge=360, le=10080)
+
+
+class SearchResultUpdate(BaseModel):
+    review_status: Literal["pending", "valid", "rejected"] | None = None
+    review_note: str | None = Field(default=None, max_length=1000)
+    hidden: bool | None = None
+
+
+class DeviceUpdate(BaseModel):
+    status: Literal["online", "offline", "disabled"] | None = None
+
+
+class AppHeartbeatRequest(BaseModel):
+    device_id: str = Field(min_length=1, max_length=100)
+    app_instance_id: str = Field(min_length=1, max_length=100)
+    app_version: str = Field(default="", max_length=50)
+    device_name: str = Field(default="", max_length=100)
+
+
+class PublishTaskResultRequest(BaseModel):
+    device_id: str = Field(min_length=1, max_length=100)
+    app_instance_id: str = Field(min_length=1, max_length=100)
+    result_id: str = Field(min_length=1, max_length=100)
+    status: Literal["published", "failed"]
+    post_id: str = Field(default="", max_length=100)
+    post_url: str = Field(default="", max_length=1000)
+    error_message: str = Field(default="", max_length=2000)
+    duration_seconds: int = Field(default=0, ge=0)
+
+
+class SearchItemPayload(BaseModel):
+    post_id: str = Field(min_length=1, max_length=100)
+    post_url: str = Field(default="", max_length=1000)
+    title: str = Field(default="", max_length=300)
+    username: str = Field(default="", max_length=100)
+    user_id: str = Field(default="", max_length=100)
+    content_preview: str = Field(default="", max_length=5000)
+    like_count: int = Field(default=0, ge=0)
+    comment_count: int = Field(default=0, ge=0)
+    collect_count: int = Field(default=0, ge=0)
+    publish_time: datetime | None = None
+
+
+class SearchTaskResultRequest(BaseModel):
+    device_id: str = Field(min_length=1, max_length=100)
+    app_instance_id: str = Field(min_length=1, max_length=100)
+    result_id: str = Field(min_length=1, max_length=100)
+    worker_cookie_id: str = Field(min_length=1, max_length=36)
+    partial_success: bool = False
+    items: list[SearchItemPayload] = Field(default_factory=list)
+    error_message: str = Field(default="", max_length=2000)
+    duration_seconds: int = Field(default=0, ge=0)
+
+
+class AnalyticsPostPayload(BaseModel):
+    post_id: str = Field(min_length=1, max_length=100)
+    title: str = Field(default="", max_length=300)
+    post_url: str = Field(default="", max_length=1000)
+    like_count: int = Field(default=0, ge=0)
+    comment_count: int = Field(default=0, ge=0)
+    collect_count: int = Field(default=0, ge=0)
+    publish_time: datetime | None = None
+
+
+class AnalyticsSnapshotPayload(BaseModel):
     account_id: str
+    nickname: str = Field(default="", max_length=100)
+    follower_count: int = Field(default=0, ge=0)
+    liked_count: int = Field(default=0, ge=0)
+    post_count: int = Field(default=0, ge=0)
+    collected_total: int | None = Field(default=None, ge=0)
+    posts: list[AnalyticsPostPayload] = Field(default_factory=list)
 
 
-class CommentInboxReplyRequest(BaseModel):
-    account_id: str
-    note_id: str = Field(min_length=1, max_length=80)
-    note_url: str = Field(default="", max_length=500)
-    message_id: str = Field(default="", max_length=120)
-    comment_id: str = Field(min_length=1, max_length=120)
-    comment_user_id: str = Field(default="", max_length=120)
-    comment_nickname: str = Field(default="", max_length=120)
-    comment_content: str = Field(default="", max_length=1000)
-    reply_text: str = Field(min_length=1, max_length=300)
+class AnalyticsTaskResultRequest(BaseModel):
+    device_id: str = Field(min_length=1, max_length=100)
+    app_instance_id: str = Field(min_length=1, max_length=100)
+    result_id: str = Field(min_length=1, max_length=100)
+    worker_cookie_id: str = Field(min_length=1, max_length=36)
+    snapshot: AnalyticsSnapshotPayload
+    error_message: str = Field(default="", max_length=2000)
+    duration_seconds: int = Field(default=0, ge=0)
 
 
-class ExternalPublishConfigRequest(BaseModel):
-    api_key: str = Field(default="", max_length=500)
-    base_url: str = Field(default="https://www.myaibot.vip", max_length=200)
-    endpoint: str = Field(default="/api/rednote/publish-with-upload", max_length=120)
+def to_account_public(account: Account) -> dict:
+    return {
+        "id": account.id,
+        "account_type": account.account_type,
+        "name": account.name,
+        "nickname": account.nickname,
+        "cookie_preview": account.cookie_preview,
+        "status": account.status,
+        "group_name": account.group_name,
+        "remark": account.remark,
+        "last_check_at": account.last_check_at,
+        "last_use_at": account.last_use_at,
+        "last_failure_at": account.last_failure_at,
+        "failure_count": account.failure_count,
+        "cooldown_until": account.cooldown_until,
+        "bound_device_id": account.bound_device_id,
+        "usage_tags": [tag.usage_tag for tag in account.usage_tags],
+        "created_at": account.created_at,
+        "updated_at": account.updated_at,
+    }
 
 
-class ExternalPublishRequest(BaseModel):
-    account_id: str = ""
-    type: str = Field(pattern="^(normal|video)$")
-    title: str = Field(default="", max_length=40)
-    content: str = Field(default="", max_length=1000)
-    images: list[str] = []
-    video: str = ""
-    cover: str = ""
-    use_upload_endpoint: bool = True
+def to_publish_task(task: PublishTask) -> dict:
+    return {
+        "id": task.id,
+        "account_id": task.account_id,
+        "title": task.title,
+        "desc": task.content,
+        "topics": task.topics_json,
+        "location": task.location,
+        "media_type": task.media_type,
+        "media_urls": task.media_urls_json,
+        "cover_url": task.cover_url,
+        "review_status": task.review_status,
+        "task_status": task.task_status,
+        "scheduled_at": task.scheduled_at,
+        "claimed_by_device_id": task.claimed_by_device_id,
+        "claim_expires_at": task.claim_expires_at,
+        "retry_count": task.retry_count,
+        "max_retry": task.max_retry,
+        "last_error": task.last_error,
+        "published_post_id": task.published_post_id,
+        "published_post_url": task.published_post_url,
+        "created_by": task.created_by,
+        "created_at": task.created_at,
+        "updated_at": task.updated_at,
+    }
 
 
-def require_account(account_id: str) -> dict:
-    account = store.get_account(account_id)
+def to_search_task(task: SearchTask) -> dict:
+    return {
+        "id": task.id,
+        "keyword": task.keyword,
+        "group_name": task.group_name,
+        "require_num": task.require_num,
+        "sort_type": task.sort_type,
+        "note_type": task.note_type,
+        "time_range": task.time_range,
+        "interval_minutes": task.interval_minutes,
+        "enabled": task.enabled,
+        "task_status": task.task_status,
+        "claimed_by_device_id": task.claimed_by_device_id,
+        "assigned_worker_account_id": task.assigned_worker_account_id,
+        "claim_expires_at": task.claim_expires_at,
+        "last_run_at": task.last_run_at,
+        "last_success_at": task.last_success_at,
+        "last_error": task.last_error,
+        "retry_count": task.retry_count,
+        "max_retry": task.max_retry,
+        "created_at": task.created_at,
+        "updated_at": task.updated_at,
+    }
+
+
+def to_analytics_task(task: AnalyticsTask) -> dict:
+    return {
+        "id": task.id,
+        "account_id": task.account_id,
+        "group_name": task.group_name,
+        "interval_minutes": task.interval_minutes,
+        "enabled": task.enabled,
+        "task_status": task.task_status,
+        "claimed_by_device_id": task.claimed_by_device_id,
+        "assigned_worker_account_id": task.assigned_worker_account_id,
+        "claim_expires_at": task.claim_expires_at,
+        "last_run_at": task.last_run_at,
+        "last_success_at": task.last_success_at,
+        "last_error": task.last_error,
+        "retry_count": task.retry_count,
+        "max_retry": task.max_retry,
+        "created_at": task.created_at,
+        "updated_at": task.updated_at,
+    }
+
+
+def to_device_public(device: Device) -> dict:
+    return {
+        "id": device.id,
+        "device_id": device.device_id,
+        "app_instance_id": device.app_instance_id,
+        "device_name": device.device_name,
+        "app_version": device.app_version,
+        "status": device.status,
+        "last_heartbeat_at": device.last_heartbeat_at,
+        "created_at": device.created_at,
+        "updated_at": device.updated_at,
+    }
+
+
+def to_search_result_public(item: SearchResult) -> dict:
+    return {
+        "id": item.id,
+        "search_task_id": item.search_task_id,
+        "result_id": item.result_id,
+        "worker_account_id": item.worker_account_id,
+        "post_id": item.post_id,
+        "post_url": item.post_url,
+        "title": item.title,
+        "content_preview": item.content_preview,
+        "author_id": item.author_id,
+        "author_name": item.author_name,
+        "like_count": item.like_count,
+        "comment_count": item.comment_count,
+        "collect_count": item.collect_count,
+        "publish_time": item.publish_time,
+        "review_status": item.review_status,
+        "review_note": item.review_note,
+        "hidden": item.hidden,
+        "created_at": item.created_at,
+    }
+
+
+def to_snapshot_public(item: AnalyticsSnapshot) -> dict:
+    return {
+        "id": item.id,
+        "analytics_task_id": item.analytics_task_id,
+        "result_id": item.result_id,
+        "account_id": item.account_id,
+        "worker_account_id": item.worker_account_id,
+        "nickname": item.nickname,
+        "follower_count": item.follower_count,
+        "liked_total": item.liked_total,
+        "post_total": item.post_total,
+        "collected_total": item.collected_total,
+        "posts": [
+            {
+                "id": post.id,
+                "post_id": post.post_id,
+                "title": post.title,
+                "post_url": post.post_url,
+                "like_count": post.like_count,
+                "comment_count": post.comment_count,
+                "collect_count": post.collect_count,
+                "publish_time": post.publish_time,
+            }
+            for post in item.posts
+        ],
+        "created_at": item.created_at,
+    }
+
+
+def write_audit_log(
+    session: Session,
+    *,
+    log_type: str,
+    operator_type: str,
+    operator_id: str,
+    target_type: str,
+    target_id: str,
+    message: str,
+    payload: dict | None = None,
+) -> None:
+    session.add(
+        AuditLog(
+            log_type=log_type,
+            operator_type=operator_type,
+            operator_id=operator_id,
+            target_type=target_type,
+            target_id=target_id,
+            message=message,
+            payload=payload or {},
+        )
+    )
+
+
+def require_account(session: Session, account_id: str, expected_type: str | None = None) -> Account:
+    account = session.get(Account, account_id)
     if not account:
         raise HTTPException(status_code=404, detail="账号不存在")
+    if expected_type and account.account_type != expected_type:
+        raise HTTPException(status_code=400, detail="账号类型不匹配")
     return account
 
 
-def cookie_cache_key(account_id: str, scope: str) -> str:
-    return f"{account_id}:{scope}"
+def set_usage_tags(session: Session, account: Account, tags: list[str]) -> None:
+    normalized = list(dict.fromkeys(tag.strip() for tag in tags if tag.strip()))
+    account.usage_tags.clear()
+    for tag in normalized:
+        account.usage_tags.append(AccountUsageTag(usage_tag=tag))
+    session.flush()
 
 
-def require_valid_pc_account(account_id: str) -> dict:
-    account = require_account(account_id)
-    cached = risk_guard.get_cookie_cache(cookie_cache_key(account_id, "pc"))
-    if cached:
-        cookie_ok, cookie_msg = cached
-    else:
-        cookie_ok, cookie_msg, _ = check_pc_cookie(account_id)
-    if not cookie_ok:
-        raise HTTPException(status_code=400, detail=f"Cookie 不可用: {cookie_msg}")
-    return account
+def refresh_account_status(account: Account) -> None:
+    now = utc_now()
+    if account.status == "cooldown" and account.cooldown_until and account.cooldown_until <= now:
+        account.status = "active"
+        account.cooldown_until = None
 
 
-def require_valid_creator_account(account_id: str) -> dict:
-    account = require_account(account_id)
-    cached = risk_guard.get_cookie_cache(cookie_cache_key(account_id, "creator"))
-    if cached:
-        cookie_ok, cookie_msg = cached
-    else:
-        cookie_ok, cookie_msg, _ = check_creator_cookie(account_id)
-    if not cookie_ok:
-        raise HTTPException(status_code=400, detail=f"Cookie 不可用: {cookie_msg}")
-    return account
+def mark_account_success(account: Account) -> None:
+    account.failure_count = 0
+    if account.status == "cooldown":
+        account.status = "active"
+        account.cooldown_until = None
 
 
-def guarded_xhs_call(account_id: str, func, *args, **kwargs):
-    risk_guard.before_request(account_id)
-    try:
-        result = func(*args, **kwargs)
-    except Exception:
-        risk_guard.record_result(account_id, False)
-        raise
-    success = bool(result[0]) if isinstance(result, tuple) and result else True
-    msg = str(result[1]) if isinstance(result, tuple) and len(result) > 1 else ""
-    risk_guard.record_result(account_id, success, msg)
-    return result
+def mark_account_failure(account: Account, message: str = "") -> None:
+    account.failure_count += 1
+    account.last_failure_at = utc_now()
+    lowered = (message or "").lower()
+    if "cookie" in lowered or "登录" in message or "invalid" in lowered:
+        account.status = "invalid"
+        account.cooldown_until = None
+        return
+    if account.failure_count >= FAILURE_COOLDOWN_THRESHOLD:
+        account.status = "cooldown"
+        account.cooldown_until = utc_now() + timedelta(seconds=FAILURE_COOLDOWN_SECONDS)
 
 
-def make_qr_svg_data_url(value: str) -> str:
-    qr = qrcode.QRCode(box_size=8, border=2)
-    qr.add_data(value)
-    qr.make(fit=True)
-    image = qr.make_image(image_factory=qrcode.image.svg.SvgPathImage)
-    buffer = BytesIO()
-    image.save(buffer)
-    payload = b64encode(buffer.getvalue()).decode("ascii")
-    return f"data:image/svg+xml;base64,{payload}"
+def validate_cookie(account: Account) -> tuple[bool, str]:
+    if len((account.cookies or "").strip()) < 20:
+        return False, "Cookie 长度不足"
+    return True, "Cookie 可用"
 
 
-def login_status_key(success: bool, msg: str) -> str:
-    if success:
-        return "success"
-    if "过期" in msg:
-        return "expired"
-    if "确认" in msg:
-        return "confirm"
-    if "扫描" in msg:
-        return "waiting_scan"
-    return "pending"
-
-
-def create_qr_login_session(platform: str) -> dict:
-    login_api = pc_login_api
-    try:
-        cookies = login_api.generate_init_cookies()
-        success, msg, qr_data = login_api.generate_qrcode(cookies)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"生成登录二维码失败: {exc}") from exc
-
-    if not success or not qr_data:
-        raise HTTPException(status_code=400, detail=msg or "生成登录二维码失败")
-
-    session = login_sessions.create(
-        platform=platform,
-        cookies=qr_data["cookies"],
-        qr_id=qr_data["qr_id"],
-        qr_url=qr_data["qr_url"],
-        code=qr_data.get("code", ""),
-    )
-    return {
-        "session_id": session["id"],
-        "platform": platform,
-        "qr_url": qr_data["qr_url"],
-        "qr_image": make_qr_svg_data_url(qr_data["qr_url"]),
-        "expires_in_seconds": LOGIN_SESSION_TTL_SECONDS,
-        "msg": msg,
-    }
-
-
-def check_qr_login_session(session_id: str, payload: LoginQrCheck) -> dict:
-    session = login_sessions.get(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="二维码登录会话不存在或已过期")
-
-    now = time.time()
-    if now - session.get("last_check_at", 0) < 1.0:
-        return {
-            "status": session.get("last_status", "pending"),
-            "msg": session.get("last_msg", "请稍后重试"),
-            "account": None,
-        }
-
-    login_api = pc_login_api
-    cookies = session["cookies"]
-    try:
-        success, msg, cookies = login_api.check_qrcode_status(session["qr_id"], session["code"], cookies)
-    except Exception as exc:
-        login_sessions.update(session_id, last_check_at=now, last_status="error", last_msg=str(exc))
-        raise HTTPException(status_code=502, detail=f"检查扫码状态失败: {exc}") from exc
-
-    status = login_status_key(success, msg)
-    login_sessions.update(session_id, cookies=cookies, last_check_at=now, last_status=status, last_msg=msg)
-    if not success:
-        if status == "expired":
-            login_sessions.delete(session_id)
-        return {"status": status, "msg": msg, "account": None}
-
-    try:
-        user_success, user_info, cookies = login_api.get_user_info(cookies)
-    except Exception:
-        user_success, user_info = False, {}
-
-    account = None
-    if payload.save_account:
-        default_name = user_info.get("nickname") or user_info.get("userName") or "PC扫码账号"
-        account_name = payload.account_name.strip() or default_name
-        account = store.create_account(account_name, login_api.cookies_to_str(cookies))
-        store.update_check_status(account["id"], "valid" if user_success else "unchecked")
-        risk_guard.set_cookie_cache(cookie_cache_key(account["id"], "pc"), True, "扫码登录成功")
-        account = store.get_account(account["id"])
-        account = store.to_public(account) if account else None
-
-    login_sessions.delete(session_id)
-    return {
-        "status": "success",
-        "msg": "扫码登录成功",
-        "account": account,
-        "user": user_info,
-    }
-
-
-def check_pc_cookie(account_id: str, force: bool = False) -> tuple[bool, str, dict | None]:
-    account = require_account(account_id)
-    cache_key = cookie_cache_key(account_id, "pc")
-    if not force:
-        cached = risk_guard.get_cookie_cache(cache_key)
-        if cached:
-            is_valid, msg = cached
-            return is_valid, msg, None
-    try:
-        success, msg, res_json = guarded_xhs_call(account_id, pc_api.get_user_self_info2, account["cookies"])
-        if not success:
-            success, msg, res_json = guarded_xhs_call(account_id, pc_api.get_user_self_info, account["cookies"])
-    except Exception as exc:
-        success, msg, res_json = False, str(exc), None
-
-    data = res_json.get("data") if isinstance(res_json, dict) else None
-    is_valid = bool(success and isinstance(data, dict))
-    if not is_valid and not msg:
-        msg = "PC Cookie 无效或登录状态异常"
-    final_msg = msg or "PC Cookie 可用"
-    risk_guard.set_cookie_cache(cache_key, is_valid, final_msg)
-    return is_valid, final_msg, res_json
-
-
-def check_creator_cookie(account_id: str, force: bool = False) -> tuple[bool, str, dict | None]:
-    account = require_account(account_id)
-    cache_key = cookie_cache_key(account_id, "creator")
-    if not force:
-        cached = risk_guard.get_cookie_cache(cache_key)
-        if cached:
-            is_valid, msg = cached
-            return is_valid, msg, None
-    try:
-        success, msg, res_json = guarded_xhs_call(
-            account_id,
-            creator_api.get_publish_note_info,
-            None,
-            account["cookies"],
+def ensure_device(session: Session, payload: AppHeartbeatRequest, request: Request | None = None) -> Device:
+    stmt = select(Device).where(Device.device_id == payload.device_id, Device.app_instance_id == payload.app_instance_id)
+    device = session.execute(stmt).scalar_one_or_none()
+    if device is None:
+        device = Device(
+            device_id=payload.device_id,
+            app_instance_id=payload.app_instance_id,
+            device_name=payload.device_name,
+            app_version=payload.app_version,
+            status="online",
+            last_seen_ip=request.client.host if request and request.client else "",
+            last_heartbeat_at=utc_now(),
         )
-    except Exception as exc:
-        success, msg, res_json = False, str(exc), None
-
-    data = res_json.get("data") if isinstance(res_json, dict) else None
-    is_valid = bool(success and isinstance(data, dict) and "notes" in data)
-    status = "valid" if is_valid else "invalid"
-    store.update_check_status(account_id, status)
-    if not is_valid and not msg:
-        msg = "Cookie 无效或登录状态异常"
-    final_msg = msg or "Cookie 可用"
-    risk_guard.set_cookie_cache(cache_key, is_valid, final_msg)
-    return is_valid, final_msg, res_json
+        session.add(device)
+    else:
+        device.device_name = payload.device_name
+        device.app_version = payload.app_version
+        if device.status != "disabled":
+            device.status = "online"
+        device.last_seen_ip = request.client.host if request and request.client else device.last_seen_ip
+        device.last_heartbeat_at = utc_now()
+    return device
 
 
-def parse_topics(raw_topics: str) -> list[str]:
-    if not raw_topics.strip():
-        return []
-    try:
-        parsed = json.loads(raw_topics)
-    except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=400, detail="topics 必须是 JSON 字符串数组") from exc
-    if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
-        raise HTTPException(status_code=400, detail="topics 必须是 JSON 字符串数组")
-    return [item.strip() for item in parsed if item.strip()]
-
-
-def extract_topics_from_text(value: str) -> list[str]:
-    topics = re.findall(r"#([^#\s，,。.！!？?\n\r]+)", value or "")
-    return list(dict.fromkeys(item.strip() for item in topics if item.strip()))
-
-
-def parse_user_id(value: str) -> str:
-    value = value.strip()
-    if not value:
-        raise HTTPException(status_code=400, detail="用户主页链接或 user_id 不能为空")
-    if value.startswith("http://") or value.startswith("https://"):
-        parsed = urlparse(value)
-        parts = [part for part in parsed.path.split("/") if part]
-        if len(parts) >= 3 and parts[0] == "user" and parts[1] == "profile":
-            return parts[2]
-        raise HTTPException(status_code=400, detail="无法从主页链接解析 user_id")
-    if not re.fullmatch(r"[A-Za-z0-9_-]{8,64}", value):
-        raise HTTPException(status_code=400, detail="user_id 格式不正确")
-    return value
-
-
-def normalize_gender(value: object) -> str:
-    if value == 0 or value == "0" or value == "male":
-        return "男"
-    if value == 1 or value == "1" or value == "female":
-        return "女"
-    if isinstance(value, str) and value:
-        return value
-    return "未知"
-
-
-def pick_count(interactions: list, index: int) -> str | int:
-    try:
-        item = interactions[index]
-        if isinstance(item, dict):
-            return item.get("count", "")
-    except (IndexError, TypeError):
-        pass
-    return ""
-
-
-def normalize_profile(data: dict, fallback_user_id: str | None = None) -> dict:
-    basic = data.get("basic_info") or data.get("basicInfo") or data
-    interactions = data.get("interactions") or []
-    user_id = (
-        fallback_user_id
-        or basic.get("user_id")
-        or basic.get("userId")
-        or data.get("user_id")
-        or data.get("userId")
-        or ""
+def touch_device_from_query(
+    session: Session,
+    request: Request | None,
+    *,
+    device_id: str,
+    app_instance_id: str = "",
+    app_version: str = "",
+    device_name: str = "",
+) -> Device | None:
+    if not app_instance_id:
+        return None
+    payload = AppHeartbeatRequest(
+        device_id=device_id,
+        app_instance_id=app_instance_id,
+        app_version=app_version,
+        device_name=device_name,
     )
-    tags = []
-    for tag in data.get("tags") or basic.get("tags") or []:
-        if isinstance(tag, dict) and tag.get("name"):
-            tags.append(tag["name"])
-        elif isinstance(tag, str):
-            tags.append(tag)
-    return {
-        "user_id": user_id,
-        "home_url": f"https://www.xiaohongshu.com/user/profile/{user_id}" if user_id else "",
-        "nickname": basic.get("nickname") or basic.get("nickName") or basic.get("userName") or "",
-        "avatar": basic.get("imageb") or basic.get("avatar") or basic.get("image") or "",
-        "red_id": basic.get("red_id") or basic.get("redId") or "",
-        "gender": normalize_gender(basic.get("gender")),
-        "ip_location": basic.get("ip_location") or basic.get("ipLocation") or "",
-        "desc": basic.get("desc") or basic.get("description") or "",
-        "follows": pick_count(interactions, 0),
-        "fans": pick_count(interactions, 1),
-        "interaction": pick_count(interactions, 2),
-        "tags": tags,
-    }
+    return ensure_device(session, payload, request)
 
 
-def resolve_account_name_from_cookies(cookies_str: str, fallback_name: str = "") -> tuple[str, str]:
-    fallback_name = fallback_name.strip()
-    if fallback_name:
-        return fallback_name, "manual"
-
-    try:
-        success, _, res_json = pc_api.get_user_self_info2(cookies_str)
-        if not success:
-            success, _, res_json = pc_api.get_user_self_info(cookies_str)
-        if success and isinstance(res_json, dict):
-            data = res_json.get("data") if isinstance(res_json.get("data"), dict) else res_json
-            nickname = normalize_profile(data).get("nickname", "").strip()
-            if nickname:
-                return nickname, "pc"
-    except Exception:
-        pass
-
-    try:
-        success, user_info, _ = creator_login_api.get_user_info(trans_cookies(cookies_str))
-        if success and isinstance(user_info, dict):
-            nickname = (user_info.get("userName") or user_info.get("nickname") or "").strip()
-            if nickname:
-                return nickname, "creator"
-    except Exception:
-        pass
-
-    return "手动账号", "fallback"
+def reset_task_to_pending(task, *, reset_retry: bool = False) -> None:
+    task.task_status = "pending"
+    task.claimed_by_device_id = ""
+    task.claim_expires_at = None
+    task.last_error = ""
+    if reset_retry:
+        task.retry_count = 0
+    if hasattr(task, "assigned_worker_account_id"):
+        task.assigned_worker_account_id = None
 
 
-def normalize_media_url(url: str | None) -> str:
-    if not url:
-        return ""
-    if url.startswith("http://"):
-        return "https://" + url[len("http://"):]
-    return url
+def reclaim_expired_claims(session: Session) -> None:
+    now = utc_now()
+    for model in (PublishTask, SearchTask, AnalyticsTask):
+        stmt = select(model).where(
+            model.task_status == "claimed",
+            model.claim_expires_at.is_not(None),
+            model.claim_expires_at <= now,
+        )
+        for task in session.execute(stmt).scalars():
+            task.task_status = "pending"
+            task.claimed_by_device_id = ""
+            task.claim_expires_at = None
+            if hasattr(task, "assigned_worker_account_id"):
+                task.assigned_worker_account_id = None
+            write_audit_log(
+                session,
+                log_type="task_reclaim",
+                operator_type="system",
+                operator_id="system",
+                target_type=model.__tablename__,
+                target_id=task.id,
+                message="任务领取超时已回收",
+                payload={},
+            )
+    session.flush()
 
 
-def build_note_url(note_id: str, xsec_token: str = "", xsec_source: str = "pc_search") -> str:
-    if not note_id:
-        return ""
-    params = {}
-    if xsec_token:
-        params["xsec_token"] = xsec_token
-    if xsec_source:
-        params["xsec_source"] = xsec_source
-    query = urlencode(params)
-    suffix = f"?{query}" if query else ""
-    return f"https://www.xiaohongshu.com/explore/{note_id}{suffix}"
+def device_has_active_task(session: Session, device_id: str) -> bool:
+    active_statuses = ("claimed", "running")
+    for model in (PublishTask, SearchTask, AnalyticsTask):
+        stmt = select(func.count()).select_from(model).where(
+            model.claimed_by_device_id == device_id,
+            model.task_status.in_(active_statuses),
+        )
+        if session.execute(stmt).scalar_one() > 0:
+            return True
+    return False
 
 
-def parse_note_url(value: str) -> dict[str, str]:
-    value = value.strip()
-    parsed = urlparse(value)
-    parts = [part for part in parsed.path.split("/") if part]
-    note_id = parts[-1] if parts else ""
-    if not note_id:
-        raise HTTPException(status_code=400, detail="无法从笔记链接解析 note_id")
-    query_pairs = {}
-    if parsed.query:
-        for part in parsed.query.split("&"):
-            if "=" not in part:
-                continue
-            key, raw_value = part.split("=", 1)
-            query_pairs[key] = raw_value
-    return {
-        "note_id": note_id,
-        "xsec_token": query_pairs.get("xsec_token", ""),
-        "xsec_source": query_pairs.get("xsec_source", "pc_search") or "pc_search",
-        "note_url": value,
-    }
+def account_has_active_publish(session: Session, account_id: str) -> bool:
+    stmt = select(func.count()).select_from(PublishTask).where(
+        PublishTask.account_id == account_id,
+        PublishTask.task_status.in_(("claimed", "running")),
+    )
+    return session.execute(stmt).scalar_one() > 0
 
 
-def normalize_search_note(item: dict) -> dict:
-    note_card = item.get("note_card") or item.get("noteCard") or {}
-    note_id = item.get("id") or item.get("note_id") or item.get("noteId") or note_card.get("note_id") or ""
-    user = note_card.get("user") or item.get("user") or {}
-    interact = note_card.get("interact_info") or note_card.get("interactInfo") or {}
-    image_list = note_card.get("image_list") or note_card.get("imageList") or []
-    cover_info = note_card.get("cover") or {}
-    cover = cover_info.get("url_pre") or cover_info.get("url_default") or cover_info.get("url") or ""
-    if image_list:
-        first_image = image_list[0]
-        if isinstance(first_image, dict):
-            cover = first_image.get("url") or first_image.get("traceId") or cover
-            info_list = first_image.get("info_list") or first_image.get("infoList") or []
-            if info_list and isinstance(info_list[-1], dict):
-                cover = info_list[-1].get("url") or cover
-    xsec_token = item.get("xsec_token") or item.get("xsecToken") or ""
-    xsec_source = item.get("xsec_source") or item.get("xsecSource") or "pc_search"
-    note_type = note_card.get("type") or item.get("note_type") or item.get("noteType") or ""
-    return {
-        "note_id": note_id,
-        "note_url": build_note_url(note_id, xsec_token, xsec_source),
-        "title": note_card.get("display_title") or note_card.get("title") or item.get("title") or "无标题",
-        "desc": note_card.get("desc") or "",
-        "cover": normalize_media_url(cover),
-        "note_type": "图文" if note_type == "normal" else ("视频" if note_type else ""),
-        "user_id": user.get("user_id") or user.get("userId") or "",
-        "nickname": user.get("nickname") or user.get("nickName") or "",
-        "liked_count": interact.get("liked_count") or interact.get("likedCount") or "",
-        "collected_count": interact.get("collected_count") or interact.get("collectedCount") or "",
-        "comment_count": interact.get("comment_count") or interact.get("commentCount") or "",
-        "xsec_token": xsec_token,
-        "xsec_source": xsec_source,
-        "image_list": [],
-        "video_addr": "",
-        "upload_time": "",
-    }
+def worker_is_busy(session: Session, worker_id: str) -> bool:
+    for model in (SearchTask, AnalyticsTask):
+        stmt = select(func.count()).select_from(model).where(
+            model.assigned_worker_account_id == worker_id,
+            model.task_status.in_(("claimed", "running")),
+        )
+        if session.execute(stmt).scalar_one() > 0:
+            return True
+    return False
 
 
-def note_dedupe_key(note: dict) -> str:
-    return str(note.get("note_id") or note.get("note_url") or "").strip()
-
-
-def is_useful_note(note: dict) -> bool:
-    if not note_dedupe_key(note):
-        return False
-    title = str(note.get("title") or "").strip()
-    nickname = str(note.get("nickname") or "").strip()
-    cover = str(note.get("cover") or "").strip()
-    if title == "无标题" and not nickname and not cover:
-        return False
-    return True
-
-
-def dedupe_notes(notes: list[dict]) -> list[dict]:
-    seen = set()
-    unique_notes = []
-    for note in notes:
-        key = note_dedupe_key(note)
-        if not key or key in seen:
+def choose_worker(session: Session, *, usage_tag: str, group_name: str = "") -> Account | None:
+    stmt = (
+        select(Account)
+        .options(selectinload(Account.usage_tags))
+        .where(Account.account_type == "worker")
+        .order_by(Account.last_use_at.is_(None).desc(), Account.last_use_at.asc(), Account.created_at.asc())
+    )
+    workers = session.execute(stmt).scalars().all()
+    now = utc_now()
+    for worker in workers:
+        refresh_account_status(worker)
+        if worker.status != "active":
             continue
-        seen.add(key)
-        unique_notes.append(note)
-    return unique_notes
+        if group_name and worker.group_name != group_name:
+            continue
+        tags = {item.usage_tag for item in worker.usage_tags}
+        if usage_tag not in tags and "worker_backup" not in tags:
+            continue
+        if worker.cooldown_until and worker.cooldown_until > now:
+            continue
+        if worker_is_busy(session, worker.id):
+            continue
+        worker.last_use_at = now
+        return worker
+    return None
 
 
-def normalize_profile_note(item: dict, xsec_source: str = "pc_user") -> dict:
-    note_id = item.get("note_id") or item.get("noteId") or item.get("id") or ""
-    xsec_token = item.get("xsec_token") or item.get("xsecToken") or ""
-    note_type = item.get("type") or item.get("note_type") or item.get("noteType") or ""
-    cover_info = item.get("cover") or {}
-    cover = ""
-    if isinstance(cover_info, dict):
-        cover = cover_info.get("url_pre") or cover_info.get("url_default") or cover_info.get("url") or ""
-    return {
-        "note_id": note_id,
-        "note_url": build_note_url(note_id, xsec_token, xsec_source),
-        "title": item.get("display_title") or item.get("title") or "无标题",
-        "desc": "",
-        "cover": normalize_media_url(cover),
-        "note_type": "图文" if note_type == "normal" else ("视频" if note_type else "笔记"),
-        "user_id": "",
-        "nickname": "",
-        "liked_count": item.get("liked_count") or item.get("likedCount") or "",
-        "collected_count": item.get("collected_count") or item.get("collectedCount") or "",
-        "comment_count": item.get("comment_count") or item.get("commentCount") or "",
-        "xsec_token": xsec_token,
-        "xsec_source": xsec_source,
-        "image_list": [],
-        "video_addr": "",
-        "upload_time": "",
-    }
+def save_task_result(
+    session: Session,
+    *,
+    task_type: str,
+    task_id: str,
+    result_id: str,
+    device_id: str,
+    app_instance_id: str,
+    status: str,
+    duration_seconds: int,
+    error_message: str,
+    payload: dict,
+) -> tuple[TaskResult, bool]:
+    stmt = select(TaskResult).where(TaskResult.task_id == task_id, TaskResult.result_id == result_id)
+    existing = session.execute(stmt).scalar_one_or_none()
+    if existing:
+        return existing, False
+    item = TaskResult(
+        task_type=task_type,
+        task_id=task_id,
+        result_id=result_id,
+        device_id=device_id,
+        app_instance_id=app_instance_id,
+        status=status,
+        duration_seconds=duration_seconds,
+        error_message=error_message,
+        payload=payload,
+    )
+    session.add(item)
+    session.flush()
+    return item, True
 
 
-def enrich_search_note(item: dict, cookies_str: str) -> dict:
-    note = normalize_search_note(item)
-    if not note["note_url"]:
-        return note
-    try:
-        success, _, res_json = pc_api.get_note_info(note["note_url"], cookies_str)
-        items = (((res_json or {}).get("data") or {}).get("items") or [])
-        if not success or not items:
-            return note
-        detail = items[0]
-        detail["url"] = note["note_url"]
-        handled = handle_note_info(detail)
-        note.update(
-            {
-                "title": handled.get("title") or note["title"],
-                "desc": handled.get("desc") or "",
-                "cover": normalize_media_url(handled.get("video_cover") or note["cover"]),
-                "note_type": handled.get("note_type") or note["note_type"],
-                "image_list": [normalize_media_url(url) for url in handled.get("image_list", [])],
-                "video_addr": normalize_media_url(handled.get("video_addr")),
-                "upload_time": handled.get("upload_time") or "",
-            }
+def claim_publish_task(session: Session, device_id: str) -> PublishTask | None:
+    reclaim_expired_claims(session)
+    if device_has_active_task(session, device_id):
+        raise HTTPException(status_code=409, detail="当前设备已有运行中任务")
+    now = utc_now()
+    stmt = (
+        select(PublishTask)
+        .where(
+            PublishTask.review_status == "approved",
+            PublishTask.task_status == "pending",
+            or_(PublishTask.scheduled_at.is_(None), PublishTask.scheduled_at <= now),
         )
-    except Exception:
-        return note
-    return note
+        .order_by(PublishTask.scheduled_at.asc().nullsfirst(), PublishTask.created_at.asc())
+    )
+    for task in session.execute(stmt).scalars():
+        account = require_account(session, task.account_id, "primary")
+        refresh_account_status(account)
+        if account.status != "active":
+            continue
+        if account.bound_device_id and account.bound_device_id != device_id:
+            continue
+        if account_has_active_publish(session, task.account_id):
+            continue
+        task.task_status = "claimed"
+        task.claimed_by_device_id = device_id
+        task.claim_expires_at = now + timedelta(minutes=CLAIM_TIMEOUT_MINUTES)
+        write_audit_log(
+            session,
+            log_type="task_claim",
+            operator_type="app",
+            operator_id=device_id,
+            target_type="publish_task",
+            target_id=task.id,
+            message="发帖任务已领取",
+            payload={"account_id": task.account_id},
+        )
+        return task
+    return None
 
 
-def normalize_comment(item: dict) -> dict:
-    user = item.get("user_info") or {}
-    sub_comments = item.get("sub_comments") or []
-    return {
-        "comment_id": item.get("id") or "",
-        "note_id": item.get("note_id") or "",
-        "note_url": item.get("note_url") or "",
-        "content": item.get("content") or "",
-        "nickname": user.get("nickname") or "",
-        "user_id": user.get("user_id") or "",
-        "reply_count": len(sub_comments),
-        "sub_comments": [normalize_comment(sub) for sub in sub_comments if isinstance(sub, dict)],
-    }
-
-
-def match_comment_keywords(content: str, keywords: list[str]) -> bool:
-    normalized = (content or "").strip().lower()
-    active_keywords = [item.strip().lower() for item in keywords if item.strip()]
-    if not active_keywords:
+def search_task_due(task: SearchTask) -> bool:
+    if not task.enabled or task.task_status != "pending":
+        return False
+    if task.last_run_at is None:
         return True
-    return any(keyword in normalized for keyword in active_keywords)
+    return task.last_run_at <= utc_now() - timedelta(minutes=task.interval_minutes)
 
 
-def render_reply_text(template: str, comment: dict) -> str:
-    reply_text = (template or "").strip()
-    if not reply_text:
-        return ""
-    return (
-        reply_text
-        .replace("{nickname}", str(comment.get("nickname") or "").strip())
-        .replace("{content}", str(comment.get("content") or "").strip())
-    )
+def claim_search_task(session: Session, device_id: str) -> tuple[SearchTask, Account] | None:
+    reclaim_expired_claims(session)
+    if device_has_active_task(session, device_id):
+        raise HTTPException(status_code=409, detail="当前设备已有运行中任务")
+    stmt = select(SearchTask).order_by(SearchTask.last_run_at.asc().nullsfirst(), SearchTask.created_at.asc())
+    for task in session.execute(stmt).scalars():
+        if not search_task_due(task):
+            continue
+        worker = choose_worker(session, usage_tag="worker_search", group_name=task.group_name)
+        if not worker:
+            continue
+        task.task_status = "claimed"
+        task.claimed_by_device_id = device_id
+        task.assigned_worker_account_id = worker.id
+        task.claim_expires_at = utc_now() + timedelta(minutes=CLAIM_TIMEOUT_MINUTES)
+        write_audit_log(
+            session,
+            log_type="cookie_assign",
+            operator_type="system",
+            operator_id="system",
+            target_type="search_task",
+            target_id=task.id,
+            message="搜索任务已分配小号",
+            payload={"worker_account_id": worker.id},
+        )
+        return task, worker
+    return None
 
 
-def has_self_reply(comment: dict, self_user_id: str) -> bool:
-    if not self_user_id:
+def analytics_task_due(task: AnalyticsTask) -> bool:
+    if not task.enabled or task.task_status != "pending":
         return False
-    return any(str(item.get("user_id") or "") == self_user_id for item in comment.get("sub_comments") or [])
+    if task.last_run_at is None:
+        return True
+    return task.last_run_at <= utc_now() - timedelta(minutes=task.interval_minutes)
 
 
-def pick_first_value(candidates: list):
-    for item in candidates:
-        if item not in (None, "", [], {}):
-            return item
-    return ""
-
-
-def nested_get(data: dict, path: list[str]):
-    current = data
-    for key in path:
-        if not isinstance(current, dict):
-            return None
-        current = current.get(key)
-    return current
-
-
-def normalize_mention_message(item: dict) -> dict:
-    note_info = pick_first_value([
-        item.get("note"),
-        item.get("note_info"),
-        item.get("noteCard"),
-        item.get("note_card"),
-        nested_get(item, ["target", "note"]),
-        nested_get(item, ["target", "note_info"]),
-    ]) or {}
-    comment_info = pick_first_value([
-        item.get("comment"),
-        item.get("comment_info"),
-        nested_get(item, ["target", "comment"]),
-        nested_get(item, ["target", "comment_info"]),
-    ]) or {}
-    user_info = pick_first_value([
-        item.get("user"),
-        item.get("user_info"),
-        comment_info.get("user_info") if isinstance(comment_info, dict) else {},
-        nested_get(item, ["target", "user"]),
-    ]) or {}
-    note_id = pick_first_value([
-        item.get("note_id"),
-        note_info.get("note_id") if isinstance(note_info, dict) else "",
-        note_info.get("id") if isinstance(note_info, dict) else "",
-    ])
-    comment_id = pick_first_value([
-        item.get("comment_id"),
-        comment_info.get("id") if isinstance(comment_info, dict) else "",
-        nested_get(item, ["target", "comment_id"]),
-    ])
-    content = pick_first_value([
-        comment_info.get("content") if isinstance(comment_info, dict) else "",
-        item.get("content"),
-        item.get("desc"),
-    ])
-    nickname = pick_first_value([
-        user_info.get("nickname") if isinstance(user_info, dict) else "",
-        user_info.get("nickName") if isinstance(user_info, dict) else "",
-        item.get("nickname"),
-    ])
-    user_id = pick_first_value([
-        user_info.get("user_id") if isinstance(user_info, dict) else "",
-        user_info.get("userid") if isinstance(user_info, dict) else "",
-        user_info.get("id") if isinstance(user_info, dict) else "",
-        item.get("user_id"),
-    ])
-    xsec_token = pick_first_value([
-        item.get("xsec_token"),
-        note_info.get("xsec_token") if isinstance(note_info, dict) else "",
-    ])
-    xsec_source = pick_first_value([
-        item.get("xsec_source"),
-        note_info.get("xsec_source") if isinstance(note_info, dict) else "",
-        "pc_search",
-    ])
-    note_url = pick_first_value([
-        item.get("note_url"),
-        note_info.get("note_url") if isinstance(note_info, dict) else "",
-        build_note_url(str(note_id), str(xsec_token), str(xsec_source)),
-    ])
-    return {
-        "message_id": str(pick_first_value([item.get("id"), item.get("message_id"), item.get("msg_id")])),
-        "message_type": str(pick_first_value([item.get("message_type"), item.get("type"), item.get("biz_type")])),
-        "note_id": str(note_id),
-        "note_url": str(note_url),
-        "comment_id": str(comment_id),
-        "comment_content": str(content),
-        "comment_nickname": str(nickname),
-        "comment_user_id": str(user_id),
-        "created_at": str(pick_first_value([item.get("time"), item.get("create_time"), item.get("created_at")])),
-        "raw": item,
-    }
-
-
-def list_unread_comment_messages(account_id: str, cookies_str: str) -> dict:
-    unread_success, unread_msg, unread_res = guarded_xhs_call(account_id, pc_api.get_unread_message, cookies_str)
-    if not unread_success:
-        raise HTTPException(status_code=400, detail=unread_msg)
-    mention_success, mention_msg, mention_items = guarded_xhs_call(account_id, pc_api.get_all_metions, cookies_str)
-    if not mention_success:
-        raise HTTPException(status_code=400, detail=mention_msg)
-    replied_comment_ids = {
-        str(item.get("comment_id") or "")
-        for item in ops_store.list_comment_reply_records()
-        if item.get("account_id") == account_id and item.get("status") == "sent"
-    }
-    messages = []
-    for item in mention_items:
-        if not isinstance(item, dict):
+def claim_analytics_task(session: Session, device_id: str) -> tuple[AnalyticsTask, Account] | None:
+    reclaim_expired_claims(session)
+    if device_has_active_task(session, device_id):
+        raise HTTPException(status_code=409, detail="当前设备已有运行中任务")
+    stmt = select(AnalyticsTask).order_by(AnalyticsTask.last_run_at.asc().nullsfirst(), AnalyticsTask.created_at.asc())
+    for task in session.execute(stmt).scalars():
+        if not analytics_task_due(task):
             continue
-        normalized = normalize_mention_message(item)
-        if not normalized["note_id"] or not normalized["comment_id"] or not normalized["comment_content"].strip():
+        worker = choose_worker(session, usage_tag="worker_analytics", group_name=task.group_name)
+        if not worker:
             continue
-        normalized["replied"] = normalized["comment_id"] in replied_comment_ids
-        messages.append(normalized)
-    return {
-        "unread": (unread_res or {}).get("data") or {},
-        "messages": messages,
-    }
-
-
-def run_comment_reply_rule_once(rule: dict) -> dict:
-    account = require_valid_pc_account(rule["account_id"])
-    note_url = rule.get("note_url") or build_note_url(
-        rule.get("note_id", ""),
-        rule.get("xsec_token", ""),
-        rule.get("xsec_source", "pc_search"),
-    )
-    success, msg, res_json = guarded_xhs_call(rule["account_id"], pc_api.get_user_self_info2, account["cookies"])
-    if not success:
-        success, msg, res_json = guarded_xhs_call(rule["account_id"], pc_api.get_user_self_info, account["cookies"])
-    if not success:
-        raise HTTPException(status_code=400, detail=msg)
-    self_user_id = normalize_profile((res_json or {}).get("data") or {}).get("user_id", "")
-
-    success, msg, comments = guarded_xhs_call(rule["account_id"], pc_api.get_note_all_comment, note_url, account["cookies"])
-    if not success:
-        ops_store.update_comment_reply_rule_run(rule["id"], "failed", msg)
-        raise HTTPException(status_code=400, detail=msg)
-
-    normalized_comments = [normalize_comment(item) for item in comments if isinstance(item, dict)]
-    matched_comments = []
-    skipped = 0
-    for comment in normalized_comments:
-        if not comment["comment_id"] or not comment["content"].strip():
-            skipped += 1
-            continue
-        if str(comment.get("user_id") or "") == self_user_id:
-            skipped += 1
-            continue
-        if ops_store.has_successful_comment_reply(rule["id"], comment["comment_id"]):
-            skipped += 1
-            continue
-        if has_self_reply(comment, self_user_id):
-            skipped += 1
-            continue
-        if not match_comment_keywords(comment["content"], rule.get("keywords", [])):
-            skipped += 1
-            continue
-        matched_comments.append(comment)
-
-    sent = []
-    failed = []
-    limit = int(rule.get("max_replies_per_run", 3) or 3)
-    for comment in matched_comments[:limit]:
-        reply_text = render_reply_text(rule.get("reply_text", ""), comment)
-        success, msg, reply_res = guarded_xhs_call(
-            rule["account_id"],
-            pc_api.post_comment,
-            rule["note_id"],
-            reply_text,
-            account["cookies"],
-            comment["comment_id"],
-            comment["comment_id"],
+        task.task_status = "claimed"
+        task.claimed_by_device_id = device_id
+        task.assigned_worker_account_id = worker.id
+        task.claim_expires_at = utc_now() + timedelta(minutes=CLAIM_TIMEOUT_MINUTES)
+        write_audit_log(
+            session,
+            log_type="cookie_assign",
+            operator_type="system",
+            operator_id="system",
+            target_type="analytics_task",
+            target_id=task.id,
+            message="监控任务已分配小号",
+            payload={"worker_account_id": worker.id},
         )
-        record = ops_store.save_comment_reply_record(
-            {
-                "rule_id": rule["id"],
-                "account_id": rule["account_id"],
-                "note_id": rule["note_id"],
-                "note_url": note_url,
-                "comment_id": comment["comment_id"],
-                "comment_user_id": comment["user_id"],
-                "comment_nickname": comment["nickname"],
-                "comment_content": comment["content"],
-                "reply_text": reply_text,
-                "status": "sent" if success else "failed",
-                "message": msg,
-                "response": reply_res,
-            }
-        )
-        if success:
-            sent.append(record)
-        else:
-            failed.append(record)
-
-    summary = f"命中 {len(matched_comments)} 条，发送 {len(sent)} 条，失败 {len(failed)} 条，跳过 {skipped} 条"
-    ops_store.update_comment_reply_rule_run(rule["id"], "success" if not failed else "partial", summary)
-    return {
-        "matched": matched_comments,
-        "sent": sent,
-        "failed": failed,
-        "skipped": skipped,
-        "summary": summary,
-    }
-
-
-def validate_media_url(url: str) -> str:
-    media_url = normalize_media_url(url.strip())
-    parsed = urlparse(media_url)
-    allowed_hosts = (
-        "xhscdn.com",
-        "xiaohongshu.com",
-    )
-    if parsed.scheme != "https" or not parsed.hostname or not parsed.hostname.endswith(allowed_hosts):
-        raise HTTPException(status_code=400, detail="不支持的媒体地址")
-    return media_url
+        return task, worker
+    return None
 
 
 @app.get("/api/health")
 def health() -> dict:
-    return {"ok": True}
+    return {"ok": True, "database_url": get_database_url()}
 
 
 @app.get("/api/accounts")
-def list_accounts() -> dict:
-    return {"accounts": store.list_accounts()}
-
-
-@app.get("/api/ops/summary")
-def get_ops_summary() -> dict:
-    return {"summary": ops_store.summary()}
-
-
-@app.get("/api/external-publish/config")
-def get_external_publish_config() -> dict:
-    return {"config": ops_store.get_external_publish_config()}
-
-
-@app.post("/api/external-publish/config")
-def save_external_publish_config(payload: ExternalPublishConfigRequest) -> dict:
-    if not payload.api_key.strip() and not ops_store.get_external_publish_config(include_secret=True).get("api_key"):
-        raise HTTPException(status_code=400, detail="请填写 API Key")
-    config = ops_store.save_external_publish_config(payload.model_dump())
-    return {"config": config}
-
-
-@app.get("/api/external-publish/records")
-def list_external_publish_records() -> dict:
-    return {"records": ops_store.list_external_publish_records()}
-
-
-@app.post("/api/external-publish/qrcode")
-def create_external_publish_qrcode(payload: ExternalPublishRequest) -> dict:
-    config = ops_store.get_external_publish_config(include_secret=True)
-    api_key = config.get("api_key")
-    if not api_key:
-        raise HTTPException(status_code=400, detail="请先保存 API Key")
-    if payload.account_id:
-        require_account(payload.account_id)
-    if payload.type == "normal" and not payload.images:
-        raise HTTPException(status_code=400, detail="图文笔记请至少填写一个图片 URL")
-    if payload.type == "video" and not payload.video:
-        raise HTTPException(status_code=400, detail="视频笔记请填写视频 URL")
-
-    endpoint = "/api/rednote/publish-with-upload" if payload.use_upload_endpoint else config["endpoint"]
-    url = f"{config['base_url'].rstrip('/')}{endpoint}"
-    request_data = {
-        "api_key": api_key,
-        "type": payload.type,
-        "title": payload.title,
-        "content": payload.content,
+def list_accounts(session: Session = Depends(get_db)) -> dict:
+    stmt = select(Account).options(selectinload(Account.usage_tags)).order_by(Account.created_at.desc())
+    accounts = session.execute(stmt).scalars().all()
+    return {
+        "primary_accounts": [to_account_public(item) for item in accounts if item.account_type == "primary"],
+        "worker_cookies": [to_account_public(item) for item in accounts if item.account_type == "worker"],
     }
-    if payload.type == "normal":
-        request_data["images"] = payload.images
-    else:
-        request_data["video"] = payload.video
-        if payload.cover:
-            request_data["cover"] = payload.cover
 
-    try:
-        response = requests.post(url, json=request_data, headers={"Content-Type": "application/json"}, timeout=REQUEST_TIMEOUT)
-        res_json = response.json()
-    except Exception as exc:
-        ops_store.log("external_publish_failed", "扫码发布接口请求失败", {"error": str(exc)})
-        raise HTTPException(status_code=400, detail=f"扫码发布接口请求失败: {exc}") from exc
 
-    safe_request = {key: value for key, value in request_data.items() if key != "api_key"}
-    record = ops_store.save_external_publish_record(
-        {
-            "title": payload.title,
-            "note_type": payload.type,
-            "provider": "myaibot",
-            "request": safe_request,
-            "response": res_json,
-        }
+@app.post("/api/accounts/primary")
+def create_primary_account(payload: PrimaryAccountCreate, session: Session = Depends(get_db)) -> dict:
+    account = Account(
+        account_type="primary",
+        name=payload.name.strip(),
+        nickname=payload.nickname.strip(),
+        cookies=payload.cookies.strip(),
+        cookie_preview=mask_cookie(payload.cookies),
+        status="active",
+        bound_device_id=payload.bound_device_id.strip(),
+        remark=payload.remark.strip(),
     )
-    if not response.ok or not res_json.get("success"):
-        error = res_json.get("error") if isinstance(res_json, dict) else None
-        message = (error or {}).get("message") if isinstance(error, dict) else response.text
-        raise HTTPException(status_code=response.status_code, detail=message or "扫码发布接口返回失败")
-    task = None
-    if payload.account_id:
-        task = ops_store.create_publish_task(
-            {
-                "account_id": payload.account_id,
-                "title": payload.title or "扫码发布",
-                "desc": payload.content,
-                "topics": extract_topics_from_text(payload.content),
-                "location": "",
-                "privacy_type": 0,
-                "media_type": "image" if payload.type == "normal" else "video",
-                "media_names": payload.images if payload.type == "normal" else [payload.video],
-                "scheduled_date": "",
-                "status": "published",
-            }
-        )
-    return {"result": res_json.get("data") or {}, "record": record, "task": task}
+    session.add(account)
+    write_audit_log(
+        session,
+        log_type="manual_action",
+        operator_type="web",
+        operator_id="web",
+        target_type="account",
+        target_id=account.id,
+        message="创建主账号",
+        payload={"account_type": "primary"},
+    )
+    session.commit()
+    session.refresh(account)
+    return {"account": to_account_public(account)}
 
 
-@app.post("/api/login/qrcode")
-def create_login_qrcode(payload: LoginQrCreate) -> dict:
-    return create_qr_login_session(payload.platform)
+@app.post("/api/accounts/primary/{account_id}/check")
+def check_primary_account(account_id: str, session: Session = Depends(get_db)) -> dict:
+    account = require_account(session, account_id, "primary")
+    ok, message = validate_cookie(account)
+    account.last_check_at = utc_now()
+    if ok:
+        account.status = "active"
+        mark_account_success(account)
+    else:
+        mark_account_failure(account, message)
+    session.commit()
+    session.refresh(account)
+    return {"success": ok, "message": message, "account": to_account_public(account)}
 
 
-@app.post("/api/login/qrcode/{session_id}/check")
-def check_login_qrcode(session_id: str, payload: LoginQrCheck) -> dict:
-    return check_qr_login_session(session_id, payload)
+@app.post("/api/app/auth/sync-cookie")
+def sync_primary_cookie(payload: PrimaryCookieSync, session: Session = Depends(get_db)) -> dict:
+    account = require_account(session, payload.account_id, "primary")
+    account.cookies = payload.cookies.strip()
+    account.cookie_preview = mask_cookie(payload.cookies)
+    account.status = "active"
+    account.last_check_at = utc_now()
+    write_audit_log(
+        session,
+        log_type="manual_action",
+        operator_type="app",
+        operator_id=payload.source,
+        target_type="account",
+        target_id=account.id,
+        message="App 同步主 Cookie",
+        payload={},
+    )
+    session.commit()
+    session.refresh(account)
+    return {"account": to_account_public(account)}
 
 
-@app.post("/api/accounts")
-def create_account(payload: AccountCreate) -> dict:
-    account_name, source = resolve_account_name_from_cookies(payload.cookies, payload.name)
-    account = store.create_account(account_name, payload.cookies)
-    if source == "pc":
-        store.update_check_status(account["id"], "valid")
-        risk_guard.set_cookie_cache(cookie_cache_key(account["id"], "pc"), True, "Cookie 可用")
-        account = store.get_account(account["id"])
-        account = store.to_public(account) if account else None
-    elif source == "creator":
-        store.update_check_status(account["id"], "valid")
-        risk_guard.set_cookie_cache(cookie_cache_key(account["id"], "creator"), True, "Cookie 可用")
-        account = store.get_account(account["id"])
-        account = store.to_public(account) if account else None
-    return {"account": account, "name_source": source}
+@app.get("/api/cookie-workers")
+def list_cookie_workers(session: Session = Depends(get_db)) -> dict:
+    stmt = (
+        select(Account)
+        .options(selectinload(Account.usage_tags))
+        .where(Account.account_type == "worker")
+        .order_by(Account.created_at.desc())
+    )
+    return {"worker_cookies": [to_account_public(item) for item in session.execute(stmt).scalars().all()]}
 
 
-@app.delete("/api/accounts/{account_id}")
-def delete_account(account_id: str) -> dict:
-    deleted = store.delete_account(account_id)
-    if not deleted:
-        raise HTTPException(status_code=404, detail="账号不存在")
-    risk_guard.clear_cookie_cache(cookie_cache_key(account_id, "pc"))
-    risk_guard.clear_cookie_cache(cookie_cache_key(account_id, "creator"))
-    return {"success": True}
+@app.post("/api/cookie-workers")
+def create_cookie_worker(payload: WorkerCookieCreate, session: Session = Depends(get_db)) -> dict:
+    worker = Account(
+        account_type="worker",
+        name=payload.name.strip(),
+        cookies=payload.cookies.strip(),
+        cookie_preview=mask_cookie(payload.cookies),
+        status="active",
+        group_name=payload.group_name.strip(),
+        remark=payload.remark.strip(),
+    )
+    session.add(worker)
+    session.flush()
+    set_usage_tags(session, worker, payload.usage_tags)
+    write_audit_log(
+        session,
+        log_type="manual_action",
+        operator_type="web",
+        operator_id="web",
+        target_type="account",
+        target_id=worker.id,
+        message="创建小号 Cookie",
+        payload={"group_name": worker.group_name},
+    )
+    session.commit()
+    session.refresh(worker)
+    return {"worker_cookie": to_account_public(worker)}
 
 
-@app.post("/api/accounts/{account_id}/check")
-def check_account(account_id: str) -> dict:
-    risk_guard.clear_cookie_cache(cookie_cache_key(account_id, "pc"))
-    risk_guard.clear_cookie_cache(cookie_cache_key(account_id, "creator"))
-    pc_success, pc_msg, _ = check_pc_cookie(account_id, force=True)
-    creator_success, creator_msg, _ = check_creator_cookie(account_id, force=True)
-    if pc_success and creator_success:
-        return {"success": True, "msg": "PC Cookie 可用；Creator Cookie 可用"}
-    if pc_success:
-        return {"success": True, "msg": f"PC Cookie 可用；Creator Cookie 不可用: {creator_msg}"}
-    if creator_success:
-        return {"success": True, "msg": f"Creator Cookie 可用；PC Cookie 不可用: {pc_msg}"}
-    return {"success": False, "msg": f"PC Cookie 不可用: {pc_msg}；Creator Cookie 不可用: {creator_msg}"}
+@app.patch("/api/cookie-workers/{worker_id}")
+def update_cookie_worker(worker_id: str, payload: WorkerCookieUpdate, session: Session = Depends(get_db)) -> dict:
+    worker = require_account(session, worker_id, "worker")
+    if payload.status is not None:
+        worker.status = normalize_status(payload.status, {"active", "cooldown", "invalid", "disabled"}, worker.status)
+    if payload.remark is not None:
+        worker.remark = payload.remark.strip()
+    if payload.group_name is not None:
+        worker.group_name = payload.group_name.strip()
+    if payload.usage_tags is not None:
+        set_usage_tags(session, worker, payload.usage_tags)
+    write_audit_log(
+        session,
+        log_type="manual_action",
+        operator_type="web",
+        operator_id="web",
+        target_type="account",
+        target_id=worker.id,
+        message="更新小号 Cookie",
+        payload={"status": worker.status},
+    )
+    session.commit()
+    session.refresh(worker)
+    return {"worker_cookie": to_account_public(worker)}
 
 
-@app.get("/api/publish-tasks")
-def list_publish_tasks() -> dict:
-    return {"tasks": ops_store.list_publish_tasks()}
+@app.post("/api/cookie-workers/{worker_id}/check")
+def check_cookie_worker(worker_id: str, session: Session = Depends(get_db)) -> dict:
+    worker = require_account(session, worker_id, "worker")
+    ok, message = validate_cookie(worker)
+    worker.last_check_at = utc_now()
+    if ok:
+        worker.status = "active"
+        mark_account_success(worker)
+    else:
+        mark_account_failure(worker, message)
+    session.commit()
+    session.refresh(worker)
+    return {"success": ok, "message": message, "worker_cookie": to_account_public(worker)}
 
 
-@app.get("/api/publish-history")
-def list_publish_history() -> dict:
-    return {"items": ops_store.list_publish_tasks()}
+@app.post("/api/app/heartbeat")
+def app_heartbeat(payload: AppHeartbeatRequest, request: Request, session: Session = Depends(get_db)) -> dict:
+    device = ensure_device(session, payload, request)
+    write_audit_log(
+        session,
+        log_type="app_result",
+        operator_type="app",
+        operator_id=payload.device_id,
+        target_type="device",
+        target_id=device.id,
+        message="设备心跳",
+        payload={"app_version": payload.app_version},
+    )
+    session.commit()
+    session.refresh(device)
+    return {"device": to_device_public(device)}
+
+
+@app.get("/api/devices")
+def list_devices(session: Session = Depends(get_db)) -> dict:
+    stmt = select(Device).order_by(Device.last_heartbeat_at.desc().nulls_last(), Device.created_at.desc())
+    return {"devices": [to_device_public(item) for item in session.execute(stmt).scalars().all()]}
+
+
+@app.patch("/api/devices/{device_id}")
+def update_device(device_id: str, payload: DeviceUpdate, session: Session = Depends(get_db)) -> dict:
+    device = session.get(Device, device_id)
+    if not device:
+        raise HTTPException(status_code=404, detail="设备不存在")
+    if payload.status is not None:
+        device.status = payload.status
+    write_audit_log(
+        session,
+        log_type="manual_action",
+        operator_type="web",
+        operator_id="web",
+        target_type="device",
+        target_id=device.id,
+        message="更新设备状态",
+        payload={"status": device.status},
+    )
+    session.commit()
+    session.refresh(device)
+    return {"device": to_device_public(device)}
 
 
 @app.post("/api/publish-tasks")
-def create_publish_task(payload: PublishTaskCreate) -> dict:
-    require_account(payload.account_id)
-    if payload.media_type not in {"image", "video"}:
-        raise HTTPException(status_code=400, detail="media_type 只能是 image 或 video")
-    task = ops_store.create_publish_task(payload.model_dump())
-    return {"task": task}
+def create_publish_task(payload: PublishTaskCreate, session: Session = Depends(get_db)) -> dict:
+    require_account(session, payload.account_id, "primary")
+    if not payload.media_urls:
+        raise HTTPException(status_code=400, detail="至少需要一个媒体 URL")
+    task = PublishTask(
+        account_id=payload.account_id,
+        title=payload.title.strip(),
+        content=payload.desc,
+        topics_json=[item.strip() for item in payload.topics if item.strip()],
+        location=payload.location.strip(),
+        media_type=payload.media_type,
+        media_urls_json=[item.strip() for item in payload.media_urls if item.strip()],
+        cover_url=payload.cover_url.strip(),
+        scheduled_at=payload.scheduled_at,
+        review_status=payload.review_status,
+        task_status="pending",
+        max_retry=payload.max_retry,
+    )
+    session.add(task)
+    write_audit_log(
+        session,
+        log_type="manual_action",
+        operator_type="web",
+        operator_id="web",
+        target_type="publish_task",
+        target_id=task.id,
+        message="创建发帖任务",
+        payload={"review_status": task.review_status},
+    )
+    session.commit()
+    session.refresh(task)
+    return {"task": to_publish_task(task)}
+
+
+@app.get("/api/publish-tasks")
+def list_publish_tasks(
+    status: str | None = Query(default=None),
+    review_status: str | None = Query(default=None),
+    session: Session = Depends(get_db),
+) -> dict:
+    stmt = select(PublishTask).order_by(PublishTask.created_at.desc())
+    if status:
+        stmt = stmt.where(PublishTask.task_status == status)
+    if review_status:
+        stmt = stmt.where(PublishTask.review_status == review_status)
+    return {"tasks": [to_publish_task(item) for item in session.execute(stmt).scalars().all()]}
+
+
+@app.get("/api/publish-records")
+def list_publish_records(session: Session = Depends(get_db)) -> dict:
+    stmt = select(PublishTask).where(PublishTask.task_status == "success").order_by(PublishTask.updated_at.desc())
+    return {"records": [to_publish_task(item) for item in session.execute(stmt).scalars().all()]}
 
 
 @app.patch("/api/publish-tasks/{task_id}")
-def update_publish_task(task_id: str, payload: TaskStatusUpdate) -> dict:
-    task = ops_store.update_publish_task_status(task_id, payload.status, payload.last_error)
+def update_publish_task(task_id: str, payload: PublishTaskUpdate, session: Session = Depends(get_db)) -> dict:
+    task = session.get(PublishTask, task_id)
     if not task:
-        raise HTTPException(status_code=404, detail="发布历史不存在")
-    return {"task": task}
-
-
-@app.delete("/api/publish-tasks/{task_id}")
-def delete_publish_task(task_id: str) -> dict:
-    if not ops_store.delete_publish_task(task_id):
-        raise HTTPException(status_code=404, detail="发布历史不存在")
-    return {"success": True}
-
-
-@app.get("/api/search-monitors")
-def list_search_monitors() -> dict:
-    return {"monitors": ops_store.list_search_monitors()}
-
-
-@app.post("/api/search-monitors")
-def create_search_monitor(payload: SearchMonitorCreate) -> dict:
-    require_account(payload.account_id)
-    monitor = ops_store.create_search_monitor(payload.model_dump())
-    return {"monitor": monitor}
-
-
-@app.delete("/api/search-monitors/{monitor_id}")
-def delete_search_monitor(monitor_id: str) -> dict:
-    if not ops_store.delete_search_monitor(monitor_id):
-        raise HTTPException(status_code=404, detail="监控任务不存在")
-    return {"success": True}
-
-
-@app.post("/api/search-monitors/{monitor_id}/run")
-def run_search_monitor(monitor_id: str) -> dict:
-    monitor = ops_store.get_search_monitor(monitor_id)
-    if not monitor:
-        raise HTTPException(status_code=404, detail="监控任务不存在")
-    account = require_valid_pc_account(monitor["account_id"])
-    success, msg, notes = guarded_xhs_call(
-        monitor["account_id"],
-        pc_api.search_some_note,
-        monitor["keyword"],
-        monitor["require_num"],
-        account["cookies"],
-        monitor["sort_type_choice"],
-        monitor["note_type"],
-        monitor["note_time"],
+        raise HTTPException(status_code=404, detail="发帖任务不存在")
+    if payload.review_status is not None:
+        task.review_status = payload.review_status
+    if payload.task_status is not None:
+        task.task_status = payload.task_status
+    write_audit_log(
+        session,
+        log_type="manual_action",
+        operator_type="web",
+        operator_id="web",
+        target_type="publish_task",
+        target_id=task.id,
+        message="更新发帖任务",
+        payload={"review_status": task.review_status, "task_status": task.task_status, "remark": payload.remark},
     )
-    if not success:
-        ops_store.update_search_monitor_run(monitor_id, "failed", msg)
-        raise HTTPException(status_code=400, detail=msg)
-    normalized = dedupe_notes([note for note in (normalize_search_note(item) for item in notes) if is_useful_note(note)])
-    saved = ops_store.save_search_results(monitor_id, monitor["keyword"], normalized)
-    ops_store.update_search_monitor_run(monitor_id, "success", f"新增 {len(saved)} 条，返回 {len(normalized)} 条")
-    return {"notes": normalized, "saved": saved}
+    session.commit()
+    session.refresh(task)
+    return {"task": to_publish_task(task)}
 
 
-@app.get("/api/comment-reply-rules")
-def list_comment_reply_rules() -> dict:
-    return {"rules": ops_store.list_comment_reply_rules()}
-
-
-@app.get("/api/comment-reply-records")
-def list_comment_reply_records(rule_id: str | None = None) -> dict:
-    return {"records": ops_store.list_comment_reply_records(rule_id)}
-
-
-@app.post("/api/comment-inbox")
-def get_comment_inbox(payload: CommentInboxRequest) -> dict:
-    account = require_valid_pc_account(payload.account_id)
-    return list_unread_comment_messages(payload.account_id, account["cookies"])
-
-
-@app.post("/api/comment-inbox/reply")
-def reply_comment_inbox_item(payload: CommentInboxReplyRequest) -> dict:
-    account = require_valid_pc_account(payload.account_id)
-    success, msg, reply_res = guarded_xhs_call(
-        payload.account_id,
-        pc_api.post_comment,
-        payload.note_id,
-        payload.reply_text,
-        account["cookies"],
-        payload.comment_id,
-        payload.comment_id,
+@app.post("/api/publish-tasks/{task_id}/requeue")
+def requeue_publish_task(task_id: str, session: Session = Depends(get_db)) -> dict:
+    task = session.get(PublishTask, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="发帖任务不存在")
+    reset_task_to_pending(task, reset_retry=True)
+    write_audit_log(
+        session,
+        log_type="manual_action",
+        operator_type="web",
+        operator_id="web",
+        target_type="publish_task",
+        target_id=task.id,
+        message="重新入队发帖任务",
+        payload={},
     )
-    record = ops_store.save_comment_reply_record(
-        {
-            "account_id": payload.account_id,
-            "rule_id": "",
-            "source": "inbox",
-            "message_id": payload.message_id,
-            "note_id": payload.note_id,
-            "note_url": payload.note_url,
-            "comment_id": payload.comment_id,
-            "comment_user_id": payload.comment_user_id,
-            "comment_nickname": payload.comment_nickname,
-            "comment_content": payload.comment_content,
-            "reply_text": payload.reply_text,
-            "status": "sent" if success else "failed",
-            "message": msg,
-            "response": reply_res,
-        }
+    session.commit()
+    session.refresh(task)
+    return {"task": to_publish_task(task)}
+
+
+@app.get("/api/app/publish-tasks/next")
+def app_next_publish_task(
+    request: Request,
+    device_id: str,
+    app_instance_id: str = Query(default=""),
+    app_version: str = Query(default=""),
+    device_name: str = Query(default=""),
+    session: Session = Depends(get_db),
+) -> dict:
+    device = touch_device_from_query(
+        session,
+        request,
+        device_id=device_id,
+        app_instance_id=app_instance_id,
+        app_version=app_version,
+        device_name=device_name,
     )
-    if not success:
-        raise HTTPException(status_code=400, detail=msg)
-    return {"record": record}
+    if device and device.status == "disabled":
+        session.commit()
+        raise HTTPException(status_code=403, detail="设备已禁用")
+    task = claim_publish_task(session, device_id)
+    session.commit()
+    return {"task": to_publish_task(task) if task else None}
 
 
-@app.post("/api/comment-reply-rules")
-def create_comment_reply_rule(payload: CommentReplyRuleCreate) -> dict:
-    require_account(payload.account_id)
-    note_info = parse_note_url(payload.note_url)
-    rule = ops_store.create_comment_reply_rule(
-        {
-            **payload.model_dump(),
-            **note_info,
-            "keywords": [item.strip() for item in payload.keywords if item.strip()],
-        }
+def handle_publish_task_result(task_id: str, payload: PublishTaskResultRequest, session: Session) -> dict:
+    task = session.get(PublishTask, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="发帖任务不存在")
+    result, created = save_task_result(
+        session,
+        task_type="publish",
+        task_id=task_id,
+        result_id=payload.result_id,
+        device_id=payload.device_id,
+        app_instance_id=payload.app_instance_id,
+        status=payload.status,
+        duration_seconds=payload.duration_seconds,
+        error_message=payload.error_message,
+        payload=payload.model_dump(mode="json"),
     )
-    return {"rule": rule}
+    if created:
+        task.claimed_by_device_id = ""
+        task.claim_expires_at = None
+        task.published_post_id = payload.post_id
+        task.published_post_url = payload.post_url
+        task.last_error = payload.error_message
+        primary = require_account(session, task.account_id, "primary")
+        if payload.status == "published":
+            task.task_status = "success"
+            mark_account_success(primary)
+        else:
+            task.task_status = "failed"
+            task.retry_count += 1
+            mark_account_failure(primary, payload.error_message)
+        write_audit_log(
+            session,
+            log_type="app_result",
+            operator_type="app",
+            operator_id=payload.device_id,
+            target_type="publish_task",
+            target_id=task.id,
+            message="回传发帖结果",
+            payload={"status": payload.status},
+        )
+        session.commit()
+        session.refresh(task)
+    return {"created": created, "result_id": result.result_id, "task": to_publish_task(task)}
 
 
-@app.delete("/api/comment-reply-rules/{rule_id}")
-def delete_comment_reply_rule(rule_id: str) -> dict:
-    if not ops_store.delete_comment_reply_rule(rule_id):
-        raise HTTPException(status_code=404, detail="评论回复规则不存在")
-    return {"success": True}
+@app.post("/api/app/publish-tasks/{task_id}/result")
+def app_publish_task_result(task_id: str, payload: PublishTaskResultRequest, session: Session = Depends(get_db)) -> dict:
+    return handle_publish_task_result(task_id, payload, session)
 
 
-@app.post("/api/comment-reply-rules/{rule_id}/run")
-def run_comment_reply_rule(rule_id: str) -> dict:
-    rule = ops_store.get_comment_reply_rule(rule_id)
-    if not rule:
-        raise HTTPException(status_code=404, detail="评论回复规则不存在")
-    result = run_comment_reply_rule_once(rule)
-    return result
+@app.post("/api/search-tasks")
+def create_search_task(payload: SearchTaskCreate, session: Session = Depends(get_db)) -> dict:
+    task = SearchTask(
+        keyword=payload.keyword.strip(),
+        group_name=payload.group_name.strip(),
+        require_num=payload.require_num,
+        sort_type=payload.sort_type.strip(),
+        note_type=payload.note_type.strip(),
+        time_range=payload.time_range.strip(),
+        interval_minutes=payload.interval_minutes,
+        enabled=payload.enabled,
+        task_status="pending",
+        max_retry=payload.max_retry,
+    )
+    session.add(task)
+    write_audit_log(
+        session,
+        log_type="manual_action",
+        operator_type="web",
+        operator_id="web",
+        target_type="search_task",
+        target_id=task.id,
+        message="创建关键词采集任务",
+        payload={"group_name": task.group_name},
+    )
+    session.commit()
+    session.refresh(task)
+    return {"task": to_search_task(task)}
+
+
+@app.get("/api/search-tasks")
+def list_search_tasks(session: Session = Depends(get_db)) -> dict:
+    stmt = select(SearchTask).order_by(SearchTask.created_at.desc())
+    return {"tasks": [to_search_task(item) for item in session.execute(stmt).scalars().all()]}
+
+
+@app.patch("/api/search-tasks/{task_id}")
+def update_search_task(task_id: str, payload: SearchTaskUpdate, session: Session = Depends(get_db)) -> dict:
+    task = session.get(SearchTask, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="关键词任务不存在")
+    if payload.enabled is not None:
+        task.enabled = payload.enabled
+    if payload.group_name is not None:
+        task.group_name = payload.group_name.strip()
+    if payload.require_num is not None:
+        task.require_num = payload.require_num
+    if payload.interval_minutes is not None:
+        task.interval_minutes = payload.interval_minutes
+    write_audit_log(
+        session,
+        log_type="manual_action",
+        operator_type="web",
+        operator_id="web",
+        target_type="search_task",
+        target_id=task.id,
+        message="更新关键词采集任务",
+        payload={"enabled": task.enabled},
+    )
+    session.commit()
+    session.refresh(task)
+    return {"task": to_search_task(task)}
+
+
+@app.post("/api/search-tasks/{task_id}/requeue")
+def requeue_search_task(task_id: str, session: Session = Depends(get_db)) -> dict:
+    task = session.get(SearchTask, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="关键词任务不存在")
+    reset_task_to_pending(task, reset_retry=True)
+    write_audit_log(
+        session,
+        log_type="manual_action",
+        operator_type="web",
+        operator_id="web",
+        target_type="search_task",
+        target_id=task.id,
+        message="重新入队关键词采集任务",
+        payload={},
+    )
+    session.commit()
+    session.refresh(task)
+    return {"task": to_search_task(task)}
+
+
+@app.get("/api/app/search-tasks/next")
+def app_next_search_task(
+    request: Request,
+    device_id: str,
+    app_instance_id: str = Query(default=""),
+    app_version: str = Query(default=""),
+    device_name: str = Query(default=""),
+    session: Session = Depends(get_db),
+) -> dict:
+    device = touch_device_from_query(
+        session,
+        request,
+        device_id=device_id,
+        app_instance_id=app_instance_id,
+        app_version=app_version,
+        device_name=device_name,
+    )
+    if device and device.status == "disabled":
+        session.commit()
+        raise HTTPException(status_code=403, detail="设备已禁用")
+    claimed = claim_search_task(session, device_id)
+    session.commit()
+    if not claimed:
+        return {"task": None}
+    task, worker = claimed
+    body = to_search_task(task)
+    body["worker_cookie_id"] = worker.id
+    return {"task": body}
+
+
+def handle_search_task_result(task_id: str, payload: SearchTaskResultRequest, session: Session) -> dict:
+    task = session.get(SearchTask, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="关键词任务不存在")
+    result_status = "partial_success" if payload.partial_success else ("failed" if payload.error_message and not payload.items else "success")
+    result, created = save_task_result(
+        session,
+        task_type="search",
+        task_id=task_id,
+        result_id=payload.result_id,
+        device_id=payload.device_id,
+        app_instance_id=payload.app_instance_id,
+        status=result_status,
+        duration_seconds=payload.duration_seconds,
+        error_message=payload.error_message,
+        payload=payload.model_dump(mode="json"),
+    )
+    saved_count = 0
+    if created:
+        worker = require_account(session, payload.worker_cookie_id, "worker")
+        task.claimed_by_device_id = ""
+        task.claim_expires_at = None
+        task.task_status = "pending"
+        task.last_run_at = utc_now()
+        task.last_error = payload.error_message
+        if payload.error_message and not payload.items:
+            task.retry_count += 1
+            mark_account_failure(worker, payload.error_message)
+        else:
+            task.last_success_at = utc_now()
+            task.retry_count = 0
+            mark_account_success(worker)
+        seen_post_ids: set[str] = set()
+        for item in payload.items:
+            if item.post_id in seen_post_ids:
+                continue
+            seen_post_ids.add(item.post_id)
+            exists_stmt = select(SearchResult).where(SearchResult.search_task_id == task.id, SearchResult.post_id == item.post_id)
+            exists = session.execute(exists_stmt).scalar_one_or_none()
+            if exists:
+                continue
+            session.add(
+                SearchResult(
+                    search_task_id=task.id,
+                    result_id=payload.result_id,
+                    worker_account_id=worker.id,
+                    post_id=item.post_id,
+                    post_url=item.post_url,
+                    title=item.title,
+                    content_preview=item.content_preview,
+                    author_id=item.user_id,
+                    author_name=item.username,
+                    like_count=item.like_count,
+                    comment_count=item.comment_count,
+                    collect_count=item.collect_count,
+                    publish_time=item.publish_time,
+                    raw_payload=item.model_dump(mode="json"),
+                )
+            )
+            saved_count += 1
+        write_audit_log(
+            session,
+            log_type="app_result",
+            operator_type="app",
+            operator_id=payload.device_id,
+            target_type="search_task",
+            target_id=task.id,
+            message="回传关键词采集结果",
+            payload={"saved_count": saved_count, "partial_success": payload.partial_success},
+        )
+        session.commit()
+    return {"created": created, "result_id": result.result_id, "saved_count": saved_count}
+
+
+@app.post("/api/app/search-tasks/{task_id}/result")
+def app_search_task_result(task_id: str, payload: SearchTaskResultRequest, session: Session = Depends(get_db)) -> dict:
+    return handle_search_task_result(task_id, payload, session)
 
 
 @app.get("/api/search-results")
-def list_saved_search_results(monitor_id: str | None = None) -> dict:
-    return {"results": ops_store.list_search_results(monitor_id)}
+def list_search_results(task_id: str | None = Query(default=None), session: Session = Depends(get_db)) -> dict:
+    stmt = select(SearchResult).order_by(SearchResult.created_at.desc())
+    if task_id:
+        stmt = stmt.where(SearchResult.search_task_id == task_id)
+    return {"results": [to_search_result_public(item) for item in session.execute(stmt).scalars().all()]}
 
 
-@app.get("/api/analytics/snapshots")
-def list_analytics_snapshots(account_id: str | None = None) -> dict:
-    return {"snapshots": ops_store.list_analytics_snapshots(account_id)}
-
-
-@app.post("/api/analytics/snapshots")
-def create_analytics_snapshot(payload: AccountRequest) -> dict:
-    account = require_valid_pc_account(payload.account_id)
-    success, msg, res_json = guarded_xhs_call(payload.account_id, pc_api.get_user_self_info2, account["cookies"])
-    if not success:
-        success, msg, res_json = guarded_xhs_call(payload.account_id, pc_api.get_user_self_info, account["cookies"])
-    if not success:
-        raise HTTPException(status_code=400, detail=msg)
-    profile = normalize_profile((res_json or {}).get("data") or {})
-    recent_notes = []
-    if profile.get("user_id"):
-        notes_success, _, notes_json = guarded_xhs_call(
-            payload.account_id,
-            pc_api.get_user_note_info,
-            profile["user_id"],
-            "",
-            account["cookies"],
-            "",
-            "pc_user",
-        )
-        if notes_success:
-            recent_notes = [
-                normalize_profile_note(item, "pc_user")
-                for item in (((notes_json or {}).get("data") or {}).get("notes") or [])[:10]
-            ]
-    snapshot = ops_store.save_analytics_snapshot(
-        {"account_id": payload.account_id, "profile": profile, "recent_notes": recent_notes}
+@app.patch("/api/search-results/{result_id}")
+def update_search_result(result_id: str, payload: SearchResultUpdate, session: Session = Depends(get_db)) -> dict:
+    item = session.get(SearchResult, result_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="采集结果不存在")
+    if payload.review_status is not None:
+        item.review_status = payload.review_status
+    if payload.review_note is not None:
+        item.review_note = payload.review_note.strip()
+    if payload.hidden is not None:
+        item.hidden = payload.hidden
+    write_audit_log(
+        session,
+        log_type="manual_action",
+        operator_type="web",
+        operator_id="web",
+        target_type="search_result",
+        target_id=item.id,
+        message="更新采集结果",
+        payload={"review_status": item.review_status, "hidden": item.hidden},
     )
-    return {"snapshot": snapshot}
+    session.commit()
+    session.refresh(item)
+    return {"result": to_search_result_public(item)}
 
 
-@app.post("/api/topics/search")
-def search_topics(payload: TopicSearchRequest) -> dict:
-    account = require_valid_creator_account(payload.account_id)
-    try:
-        cookies = trans_cookies(account["cookies"])
-        success, msg, res_json = guarded_xhs_call(
-            payload.account_id,
-            creator_api.get_topic,
-            payload.keyword,
-            cookies,
+@app.post("/api/analytics-tasks")
+def create_analytics_task(payload: AnalyticsTaskCreate, session: Session = Depends(get_db)) -> dict:
+    require_account(session, payload.account_id, "primary")
+    task = AnalyticsTask(
+        account_id=payload.account_id,
+        interval_minutes=payload.interval_minutes,
+        enabled=payload.enabled,
+        group_name=payload.group_name.strip(),
+        task_status="pending",
+        max_retry=payload.max_retry,
+    )
+    session.add(task)
+    write_audit_log(
+        session,
+        log_type="manual_action",
+        operator_type="web",
+        operator_id="web",
+        target_type="analytics_task",
+        target_id=task.id,
+        message="创建账号监控任务",
+        payload={"group_name": task.group_name},
+    )
+    session.commit()
+    session.refresh(task)
+    return {"task": to_analytics_task(task)}
+
+
+@app.get("/api/analytics-tasks")
+def list_analytics_tasks(session: Session = Depends(get_db)) -> dict:
+    stmt = select(AnalyticsTask).order_by(AnalyticsTask.created_at.desc())
+    return {"tasks": [to_analytics_task(item) for item in session.execute(stmt).scalars().all()]}
+
+
+@app.patch("/api/analytics-tasks/{task_id}")
+def update_analytics_task(task_id: str, payload: AnalyticsTaskUpdate, session: Session = Depends(get_db)) -> dict:
+    task = session.get(AnalyticsTask, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="账号监控任务不存在")
+    if payload.enabled is not None:
+        task.enabled = payload.enabled
+    if payload.group_name is not None:
+        task.group_name = payload.group_name.strip()
+    if payload.interval_minutes is not None:
+        task.interval_minutes = payload.interval_minutes
+    write_audit_log(
+        session,
+        log_type="manual_action",
+        operator_type="web",
+        operator_id="web",
+        target_type="analytics_task",
+        target_id=task.id,
+        message="更新账号监控任务",
+        payload={"enabled": task.enabled},
+    )
+    session.commit()
+    session.refresh(task)
+    return {"task": to_analytics_task(task)}
+
+
+@app.post("/api/analytics-tasks/{task_id}/requeue")
+def requeue_analytics_task(task_id: str, session: Session = Depends(get_db)) -> dict:
+    task = session.get(AnalyticsTask, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="账号监控任务不存在")
+    reset_task_to_pending(task, reset_retry=True)
+    write_audit_log(
+        session,
+        log_type="manual_action",
+        operator_type="web",
+        operator_id="web",
+        target_type="analytics_task",
+        target_id=task.id,
+        message="重新入队账号监控任务",
+        payload={},
+    )
+    session.commit()
+    session.refresh(task)
+    return {"task": to_analytics_task(task)}
+
+
+@app.get("/api/app/analytics-tasks/next")
+def app_next_analytics_task(
+    request: Request,
+    device_id: str,
+    app_instance_id: str = Query(default=""),
+    app_version: str = Query(default=""),
+    device_name: str = Query(default=""),
+    session: Session = Depends(get_db),
+) -> dict:
+    device = touch_device_from_query(
+        session,
+        request,
+        device_id=device_id,
+        app_instance_id=app_instance_id,
+        app_version=app_version,
+        device_name=device_name,
+    )
+    if device and device.status == "disabled":
+        session.commit()
+        raise HTTPException(status_code=403, detail="设备已禁用")
+    claimed = claim_analytics_task(session, device_id)
+    session.commit()
+    if not claimed:
+        return {"task": None}
+    task, worker = claimed
+    body = to_analytics_task(task)
+    body["worker_cookie_id"] = worker.id
+    return {"task": body}
+
+
+def handle_analytics_task_result(task_id: str, payload: AnalyticsTaskResultRequest, session: Session) -> dict:
+    task = session.get(AnalyticsTask, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="账号监控任务不存在")
+    result_status = "failed" if payload.error_message and not payload.snapshot.posts else "success"
+    result, created = save_task_result(
+        session,
+        task_type="analytics",
+        task_id=task_id,
+        result_id=payload.result_id,
+        device_id=payload.device_id,
+        app_instance_id=payload.app_instance_id,
+        status=result_status,
+        duration_seconds=payload.duration_seconds,
+        error_message=payload.error_message,
+        payload=payload.model_dump(mode="json"),
+    )
+    snapshot_id = ""
+    if created:
+        worker = require_account(session, payload.worker_cookie_id, "worker")
+        task.claimed_by_device_id = ""
+        task.claim_expires_at = None
+        task.task_status = "pending"
+        task.last_run_at = utc_now()
+        task.last_error = payload.error_message
+        if payload.error_message and not payload.snapshot.posts:
+            task.retry_count += 1
+            mark_account_failure(worker, payload.error_message)
+        else:
+            task.last_success_at = utc_now()
+            task.retry_count = 0
+            mark_account_success(worker)
+
+        snapshot = AnalyticsSnapshot(
+            analytics_task_id=task.id,
+            result_id=payload.result_id,
+            account_id=payload.snapshot.account_id,
+            worker_account_id=worker.id,
+            nickname=payload.snapshot.nickname,
+            follower_count=payload.snapshot.follower_count,
+            liked_total=payload.snapshot.liked_count,
+            post_total=payload.snapshot.post_count,
+            collected_total=payload.snapshot.collected_total,
+            raw_payload=payload.snapshot.model_dump(mode="json"),
         )
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if not success:
-        raise HTTPException(status_code=400, detail=msg)
-    topics = ((res_json or {}).get("data") or {}).get("topic_info_dtos") or []
+        session.add(snapshot)
+        session.flush()
+        snapshot_id = snapshot.id
+        for post in payload.snapshot.posts:
+            session.add(
+                AnalyticsSnapshotPost(
+                    snapshot_id=snapshot.id,
+                    post_id=post.post_id,
+                    title=post.title,
+                    post_url=post.post_url,
+                    like_count=post.like_count,
+                    comment_count=post.comment_count,
+                    collect_count=post.collect_count,
+                    publish_time=post.publish_time,
+                    raw_payload=post.model_dump(mode="json"),
+                )
+            )
+        write_audit_log(
+            session,
+            log_type="app_result",
+            operator_type="app",
+            operator_id=payload.device_id,
+            target_type="analytics_task",
+            target_id=task.id,
+            message="回传账号监控结果",
+            payload={"snapshot_id": snapshot_id},
+        )
+        session.commit()
+    return {"created": created, "result_id": result.result_id, "snapshot_id": snapshot_id}
+
+
+@app.post("/api/app/analytics-tasks/{task_id}/result")
+def app_analytics_task_result(task_id: str, payload: AnalyticsTaskResultRequest, session: Session = Depends(get_db)) -> dict:
+    return handle_analytics_task_result(task_id, payload, session)
+
+
+@app.get("/api/app/tasks/next")
+def app_next_task(
+    request: Request,
+    device_id: str,
+    app_instance_id: str,
+    app_version: str = Query(default=""),
+    device_name: str = Query(default=""),
+    session: Session = Depends(get_db),
+) -> dict:
+    device = ensure_device(
+        session,
+        AppHeartbeatRequest(
+            device_id=device_id,
+            app_instance_id=app_instance_id,
+            app_version=app_version,
+            device_name=device_name,
+        ),
+        request,
+    )
+    if device.status == "disabled":
+        session.commit()
+        raise HTTPException(status_code=403, detail="设备已禁用")
+
+    task = claim_publish_task(session, device_id)
+    if task:
+        session.commit()
+        return {"task_type": "publish", "task": to_publish_task(task)}
+
+    claimed_search = claim_search_task(session, device_id)
+    if claimed_search:
+        task, worker = claimed_search
+        body = to_search_task(task)
+        body["worker_cookie_id"] = worker.id
+        session.commit()
+        return {"task_type": "search", "task": body}
+
+    claimed_analytics = claim_analytics_task(session, device_id)
+    if claimed_analytics:
+        task, worker = claimed_analytics
+        body = to_analytics_task(task)
+        body["worker_cookie_id"] = worker.id
+        session.commit()
+        return {"task_type": "analytics", "task": body}
+
+    session.commit()
+    return {"task_type": None, "task": None}
+
+
+@app.post("/api/app/tasks/{task_type}/{task_id}/result")
+def app_task_result(task_type: str, task_id: str, payload: dict, session: Session = Depends(get_db)) -> dict:
+    try:
+        if task_type == "publish":
+            return handle_publish_task_result(task_id, PublishTaskResultRequest.model_validate(payload), session)
+        if task_type == "search":
+            return handle_search_task_result(task_id, SearchTaskResultRequest.model_validate(payload), session)
+        if task_type == "analytics":
+            return handle_analytics_task_result(task_id, AnalyticsTaskResultRequest.model_validate(payload), session)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors()) from exc
+    raise HTTPException(status_code=404, detail="任务类型不存在")
+
+
+@app.get("/api/analytics-snapshots")
+def list_analytics_snapshots(account_id: str | None = Query(default=None), session: Session = Depends(get_db)) -> dict:
+    stmt = select(AnalyticsSnapshot).options(selectinload(AnalyticsSnapshot.posts)).order_by(AnalyticsSnapshot.created_at.desc())
+    if account_id:
+        stmt = stmt.where(AnalyticsSnapshot.account_id == account_id)
+    return {"snapshots": [to_snapshot_public(item) for item in session.execute(stmt).scalars().all()]}
+
+
+@app.get("/api/logs")
+def list_logs(session: Session = Depends(get_db)) -> dict:
+    stmt = select(AuditLog).order_by(AuditLog.created_at.desc()).limit(200)
+    items = session.execute(stmt).scalars().all()
     return {
-        "topics": [
+        "logs": [
             {
-                "id": item.get("id"),
-                "name": item.get("name"),
-                "link": item.get("link"),
+                "id": item.id,
+                "log_type": item.log_type,
+                "operator_type": item.operator_type,
+                "operator_id": item.operator_id,
+                "target_type": item.target_type,
+                "target_id": item.target_id,
+                "message": item.message,
+                "payload": item.payload,
+                "created_at": item.created_at,
             }
-            for item in topics
+            for item in items
         ]
     }
 
 
-@app.post("/api/profile/self")
-def get_self_profile(payload: AccountRequest) -> dict:
-    account = require_valid_pc_account(payload.account_id)
-    success, msg, res_json = guarded_xhs_call(payload.account_id, pc_api.get_user_self_info2, account["cookies"])
-    if not success:
-        success, msg, res_json = guarded_xhs_call(payload.account_id, pc_api.get_user_self_info, account["cookies"])
-    if not success:
-        raise HTTPException(status_code=400, detail=msg)
-    data = (res_json or {}).get("data") or {}
-    return {"profile": normalize_profile(data)}
-
-
-@app.post("/api/profile/query")
-def query_profile(payload: ProfileQueryRequest) -> dict:
-    account = require_valid_pc_account(payload.account_id)
-    user_id = parse_user_id(payload.user_url_or_id)
-    success, msg, res_json = guarded_xhs_call(
-        payload.account_id,
-        pc_api.get_user_info,
-        user_id,
-        account["cookies"],
-    )
-    if not success:
-        raise HTTPException(status_code=400, detail=msg)
-    data = (res_json or {}).get("data") or {}
-    return {"profile": normalize_profile(data, user_id)}
-
-
-@app.post("/api/profile/notes")
-def get_profile_notes(payload: ProfileNotesRequest) -> dict:
-    account = require_valid_pc_account(payload.account_id)
-    success, msg, res_json = guarded_xhs_call(
-        payload.account_id,
-        pc_api.get_user_note_info,
-        payload.user_id,
-        payload.cursor,
-        account["cookies"],
-        payload.xsec_token,
-        payload.xsec_source or "pc_user",
-    )
-    if not success:
-        raise HTTPException(status_code=400, detail=msg)
-    data = (res_json or {}).get("data") or {}
-    notes = data.get("notes") or []
-    return {
-        "notes": [normalize_profile_note(item, payload.xsec_source or "pc_user") for item in notes],
-        "cursor": str(data.get("cursor") or ""),
-        "has_more": bool(data.get("has_more")),
+@app.get("/api/ops/summary")
+def ops_summary(session: Session = Depends(get_db)) -> dict:
+    logs_stmt = select(AuditLog).order_by(AuditLog.created_at.desc()).limit(20)
+    latest_logs = session.execute(logs_stmt).scalars().all()
+    summary = {
+        "primary_account_total": session.execute(select(func.count()).select_from(Account).where(Account.account_type == "primary")).scalar_one(),
+        "worker_cookie_total": session.execute(select(func.count()).select_from(Account).where(Account.account_type == "worker")).scalar_one(),
+        "worker_cookie_active": session.execute(select(func.count()).select_from(Account).where(Account.account_type == "worker", Account.status == "active")).scalar_one(),
+        "publish_pending": session.execute(select(func.count()).select_from(PublishTask).where(PublishTask.task_status == "pending")).scalar_one(),
+        "publish_success": session.execute(select(func.count()).select_from(PublishTask).where(PublishTask.task_status == "success")).scalar_one(),
+        "search_task_total": session.execute(select(func.count()).select_from(SearchTask)).scalar_one(),
+        "search_result_total": session.execute(select(func.count()).select_from(SearchResult)).scalar_one(),
+        "analytics_task_total": session.execute(select(func.count()).select_from(AnalyticsTask)).scalar_one(),
+        "analytics_snapshot_total": session.execute(select(func.count()).select_from(AnalyticsSnapshot)).scalar_one(),
+        "online_device_total": session.execute(select(func.count()).select_from(Device).where(Device.status == "online")).scalar_one(),
+        "latest_logs": [
+            {
+                "id": item.id,
+                "log_type": item.log_type,
+                "message": item.message,
+                "created_at": item.created_at,
+            }
+            for item in latest_logs
+        ],
     }
-
-
-@app.post("/api/search/notes")
-def search_notes(payload: SearchNotesRequest) -> dict:
-    account = require_valid_pc_account(payload.account_id)
-    success, msg, notes = guarded_xhs_call(
-        payload.account_id,
-        pc_api.search_some_note,
-        payload.query,
-        payload.require_num,
-        account["cookies"],
-        payload.sort_type_choice,
-        payload.note_type,
-        payload.note_time,
-    )
-    if not success:
-        raise HTTPException(status_code=400, detail=msg)
-    normalized = dedupe_notes([note for note in (normalize_search_note(item) for item in notes) if is_useful_note(note)])
-    return {"notes": normalized, "detail_mode": "manual"}
-
-
-@app.post("/api/search/note-detail")
-def get_search_note_detail(payload: NoteDetailRequest) -> dict:
-    account = require_valid_pc_account(payload.account_id)
-    note_url = payload.note_url
-    if payload.note_id and not note_url:
-        note_url = build_note_url(payload.note_id, payload.xsec_token, payload.xsec_source or "pc_search")
-    note = {
-        "note_url": note_url,
-        "note_id": payload.note_id,
-        "xsec_token": payload.xsec_token,
-        "xsec_source": payload.xsec_source or "pc_search",
-    }
-    try:
-        success, msg, res_json = guarded_xhs_call(
-            payload.account_id,
-            pc_api.get_note_info,
-            note_url,
-            account["cookies"],
-        )
-        items = (((res_json or {}).get("data") or {}).get("items") or [])
-        if not success or not items:
-            raise HTTPException(status_code=400, detail=msg or "笔记详情获取失败")
-        detail = items[0]
-        detail["url"] = note_url
-        handled = handle_note_info(detail)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"笔记详情获取失败: {exc}") from exc
-
-    note.update(
-        {
-            "title": handled.get("title") or "无标题",
-            "desc": handled.get("desc") or "",
-            "cover": normalize_media_url(handled.get("video_cover")),
-            "note_type": handled.get("note_type") or "",
-            "user_id": handled.get("user_id") or "",
-            "nickname": handled.get("nickname") or "",
-            "liked_count": handled.get("liked_count") or "",
-            "collected_count": handled.get("collected_count") or "",
-            "comment_count": handled.get("comment_count") or "",
-            "note_url": note_url,
-            "image_list": [normalize_media_url(url) for url in handled.get("image_list", [])],
-            "video_addr": normalize_media_url(handled.get("video_addr")),
-            "upload_time": handled.get("upload_time") or "",
-        }
-    )
-    return {"note": note}
-
-
-@app.get("/api/media/proxy")
-def proxy_media(url: str):
-    media_url = validate_media_url(url)
-    try:
-        response = requests.get(
-            media_url,
-            headers={
-                "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-                "referer": "https://www.xiaohongshu.com/",
-            },
-            stream=True,
-            timeout=REQUEST_TIMEOUT,
-        )
-        response.raise_for_status()
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"媒体加载失败: {exc}") from exc
-
-    def iter_content():
-        try:
-            for chunk in response.iter_content(chunk_size=1024 * 256):
-                if chunk:
-                    yield chunk
-        finally:
-            response.close()
-
-    return StreamingResponse(
-        iter_content(),
-        media_type=response.headers.get("content-type") or "application/octet-stream",
-    )
-
-
-@app.post("/api/publish")
-async def publish_note(
-    account_id: Annotated[str, Form()],
-    title: Annotated[str, Form()],
-    desc: Annotated[str, Form()] = "",
-    topics: Annotated[str, Form()] = "[]",
-    location: Annotated[str | None, Form()] = None,
-    privacy_type: Annotated[int, Form()] = 1,
-    media_type: Annotated[str, Form()] = "image",
-    images: Annotated[list[UploadFile], File()] = [],
-    video: Annotated[UploadFile | None, File()] = None,
-) -> dict:
-    account = require_account(account_id)
-
-    topic_list = parse_topics(topics)
-    note_info = {
-        "title": title.strip(),
-        "desc": desc,
-        "postTime": None,
-        "location": location.strip() if location else None,
-        "type": privacy_type,
-        "media_type": media_type,
-        "topics": topic_list,
-    }
-
-    if not note_info["title"]:
-        raise HTTPException(status_code=400, detail="标题不能为空")
-    if media_type == "image":
-        if video is not None:
-            raise HTTPException(status_code=400, detail="图文发布不能同时上传视频")
-        image_bytes = [await item.read() for item in images if item.filename]
-        if not image_bytes:
-            raise HTTPException(status_code=400, detail="请至少上传一张图片")
-        note_info["images"] = image_bytes
-    elif media_type == "video":
-        if images:
-            raise HTTPException(status_code=400, detail="视频发布不能同时上传图片")
-        if video is None:
-            raise HTTPException(status_code=400, detail="请上传一个视频")
-        note_info["video"] = await video.read()
-    else:
-        raise HTTPException(status_code=400, detail="media_type 只能是 image 或 video")
-
-    try:
-        success, msg, res_json = guarded_xhs_call(
-            account_id,
-            creator_api.post_note,
-            note_info,
-            account["cookies"],
-        )
-    except Exception as exc:
-        ops_store.log("publish_failed", "发布接口异常", {"account_id": account_id, "error": str(exc)})
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    ops_store.create_publish_task(
-        {
-            "account_id": account_id,
-            "title": note_info["title"],
-            "desc": note_info["desc"],
-            "topics": topic_list,
-            "location": note_info["location"] or "",
-            "privacy_type": privacy_type,
-            "media_type": media_type,
-            "media_names": [item.filename for item in images if item.filename] if media_type == "image" else [video.filename if video else ""],
-            "scheduled_date": "",
-            "status": "published" if success else "failed",
-        }
-    )
-    return {"success": success, "msg": msg, "data": res_json}
+    return {"summary": summary}
 
 
 if FRONTEND_DIST.exists():
