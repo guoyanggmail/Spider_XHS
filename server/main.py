@@ -1,16 +1,22 @@
 from __future__ import annotations
 
 import os
+import base64
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import Literal
+from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from loguru import logger
 from pydantic import BaseModel, Field, ValidationError
+import qrcode
+import qrcode.image.svg
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
@@ -28,15 +34,21 @@ from server.models import (
     SearchTask,
     TaskResult,
 )
+from apis.xhs_pc_apis import XHS_Apis
+from apis.xhs_pc_login_apis import XHSLoginApi
 
 
 COOKIE_CHECK_TTL_SECONDS = 600
 FAILURE_COOLDOWN_THRESHOLD = 3
 FAILURE_COOLDOWN_SECONDS = 300
 CLAIM_TIMEOUT_MINUTES = 15
+LOGIN_SESSION_TTL_SECONDS = 600
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 FRONTEND_DIST = ROOT_DIR / "frontend" / "dist"
+LOG_DIR = ROOT_DIR / "logs"
+LOGIN_SESSION_STORE: dict[str, dict] = {}
+LOGGER_CONFIGURED = False
 
 
 def utc_now() -> datetime:
@@ -64,6 +76,25 @@ def disable_proxy_for_xhs() -> None:
 
 
 disable_proxy_for_xhs()
+
+
+def configure_app_logger() -> None:
+    global LOGGER_CONFIGURED
+    if LOGGER_CONFIGURED:
+        return
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    logger.add(
+        LOG_DIR / "backend.log",
+        level="INFO",
+        rotation="10 MB",
+        retention="7 days",
+        encoding="utf-8",
+        enqueue=False,
+    )
+    LOGGER_CONFIGURED = True
+
+
+configure_app_logger()
 
 
 @asynccontextmanager
@@ -100,9 +131,29 @@ class PrimaryCookieSync(BaseModel):
     source: str = Field(default="android_app", max_length=50)
 
 
+class AppSmsCodeRequest(BaseModel):
+    phone: str = Field(min_length=1, max_length=32)
+    zone: str = Field(default="86", max_length=8)
+
+
+class AppSmsLoginRequest(BaseModel):
+    login_session_id: str = Field(min_length=1, max_length=64)
+    phone: str = Field(min_length=1, max_length=32)
+    code: str = Field(min_length=1, max_length=16)
+    zone: str = Field(default="86", max_length=8)
+    account_id: str = Field(default="")
+
+
 class WorkerCookieCreate(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     cookies: str = Field(min_length=20)
+    remark: str = Field(default="", max_length=500)
+    usage_tags: list[str] = Field(default_factory=list)
+    group_name: str = Field(default="", max_length=100)
+
+
+class WorkerLoginDraft(BaseModel):
+    name: str = Field(default="", max_length=100)
     remark: str = Field(default="", max_length=500)
     usage_tags: list[str] = Field(default_factory=list)
     group_name: str = Field(default="", max_length=100)
@@ -113,6 +164,26 @@ class WorkerCookieUpdate(BaseModel):
     remark: str | None = Field(default=None, max_length=500)
     usage_tags: list[str] | None = None
     group_name: str | None = Field(default=None, max_length=100)
+
+
+class WorkerSmsCodeRequest(WorkerLoginDraft):
+    phone: str = Field(min_length=1, max_length=32)
+    zone: str = Field(default="86", max_length=8)
+
+
+class WorkerSmsLoginRequest(WorkerLoginDraft):
+    login_session_id: str = Field(min_length=1, max_length=64)
+    phone: str = Field(min_length=1, max_length=32)
+    code: str = Field(min_length=1, max_length=16)
+    zone: str = Field(default="86", max_length=8)
+
+
+class WorkerQrCodeRequest(WorkerLoginDraft):
+    pass
+
+
+class WorkerQrCodeCheckRequest(WorkerLoginDraft):
+    login_session_id: str = Field(min_length=1, max_length=64)
 
 
 class PublishTaskCreate(BaseModel):
@@ -145,6 +216,25 @@ class SearchTaskCreate(BaseModel):
     enabled: bool = True
     group_name: str = Field(default="", max_length=100)
     max_retry: int = Field(default=1, ge=0, le=5)
+
+
+class AppSearchTaskCreate(SearchTaskCreate):
+    device_id: str = Field(default="", max_length=100)
+    app_instance_id: str = Field(default="", max_length=100)
+
+
+class AppDirectSearchRequest(BaseModel):
+    account_id: str = Field(min_length=1, max_length=36)
+    keyword: str = Field(min_length=1, max_length=200)
+    require_num: int = Field(default=10, ge=1, le=20)
+    sort_type: str = Field(default="general", max_length=30)
+    note_type: str = Field(default="all", max_length=30)
+    time_range: str = Field(default="all", max_length=30)
+
+
+class AppSearchPostDetailRequest(BaseModel):
+    account_id: str = Field(min_length=1, max_length=36)
+    post_url: str = Field(min_length=1, max_length=1000)
 
 
 class SearchTaskUpdate(BaseModel):
@@ -203,6 +293,12 @@ class SearchItemPayload(BaseModel):
     username: str = Field(default="", max_length=100)
     user_id: str = Field(default="", max_length=100)
     content_preview: str = Field(default="", max_length=5000)
+    content: str = Field(default="", max_length=20000)
+    note_type: str = Field(default="", max_length=30)
+    topics: list[str] = Field(default_factory=list)
+    image_urls: list[str] = Field(default_factory=list)
+    video_url: str = Field(default="", max_length=2000)
+    video_cover_url: str = Field(default="", max_length=2000)
     like_count: int = Field(default=0, ge=0)
     comment_count: int = Field(default=0, ge=0)
     collect_count: int = Field(default=0, ge=0)
@@ -213,7 +309,7 @@ class SearchTaskResultRequest(BaseModel):
     device_id: str = Field(min_length=1, max_length=100)
     app_instance_id: str = Field(min_length=1, max_length=100)
     result_id: str = Field(min_length=1, max_length=100)
-    worker_cookie_id: str = Field(min_length=1, max_length=36)
+    worker_cookie_id: str = Field(default="", max_length=36)
     partial_success: bool = False
     items: list[SearchItemPayload] = Field(default_factory=list)
     error_message: str = Field(default="", max_length=2000)
@@ -360,6 +456,15 @@ def to_device_public(device: Device) -> dict:
 
 
 def to_search_result_public(item: SearchResult) -> dict:
+    raw_payload = item.raw_payload or {}
+    content = first_non_blank_text(raw_payload.get("content"), raw_payload.get("content_preview"), item.content_preview)
+    title = first_non_blank_text(item.title, raw_payload.get("title")) or build_title_fallback(content)
+    topics = raw_payload.get("topics")
+    if not isinstance(topics, list):
+        topics = []
+    image_urls = raw_payload.get("image_urls")
+    if not isinstance(image_urls, list):
+        image_urls = []
     return {
         "id": item.id,
         "search_task_id": item.search_task_id,
@@ -367,8 +472,14 @@ def to_search_result_public(item: SearchResult) -> dict:
         "worker_account_id": item.worker_account_id,
         "post_id": item.post_id,
         "post_url": item.post_url,
-        "title": item.title,
+        "title": title,
         "content_preview": item.content_preview,
+        "content": content,
+        "note_type": first_non_blank_text(raw_payload.get("note_type")),
+        "topics": topics,
+        "image_urls": image_urls,
+        "video_url": first_non_blank_text(raw_payload.get("video_url")),
+        "video_cover_url": first_non_blank_text(raw_payload.get("video_cover_url")),
         "author_id": item.author_id,
         "author_name": item.author_name,
         "like_count": item.like_count,
@@ -379,6 +490,30 @@ def to_search_result_public(item: SearchResult) -> dict:
         "review_note": item.review_note,
         "hidden": item.hidden,
         "created_at": item.created_at,
+    }
+
+
+def to_account_summary(account: Account) -> dict:
+    return {
+        "id": account.id,
+        "name": account.name,
+        "nickname": account.nickname,
+        "status": account.status,
+        "cookie_preview": account.cookie_preview,
+        "remark": account.remark,
+        "last_check_at": account.last_check_at,
+        "last_failure_at": account.last_failure_at,
+        "failure_count": account.failure_count,
+        "cooldown_until": account.cooldown_until,
+        "bound_device_id": account.bound_device_id,
+    }
+
+
+def to_search_task_detail(task: SearchTask, results: list[SearchResult]) -> dict:
+    return {
+        "task": to_search_task(task),
+        "post_count": len(results),
+        "results": [to_search_result_public(item) for item in results],
     }
 
 
@@ -446,9 +581,14 @@ def require_account(session: Session, account_id: str, expected_type: str | None
 
 def set_usage_tags(session: Session, account: Account, tags: list[str]) -> None:
     normalized = list(dict.fromkeys(tag.strip() for tag in tags if tag.strip()))
-    account.usage_tags.clear()
+    existing_tags = {item.usage_tag: item for item in list(account.usage_tags)}
+    for usage_tag, item in existing_tags.items():
+        if usage_tag not in normalized:
+            account.usage_tags.remove(item)
+    current = {item.usage_tag for item in account.usage_tags}
     for tag in normalized:
-        account.usage_tags.append(AccountUsageTag(usage_tag=tag))
+        if tag not in current:
+            account.usage_tags.append(AccountUsageTag(usage_tag=tag))
     session.flush()
 
 
@@ -483,6 +623,468 @@ def validate_cookie(account: Account) -> tuple[bool, str]:
     if len((account.cookies or "").strip()) < 20:
         return False, "Cookie 长度不足"
     return True, "Cookie 可用"
+
+
+def get_pc_login_api() -> XHSLoginApi:
+    return XHSLoginApi()
+
+
+def get_pc_content_api() -> XHS_Apis:
+    return XHS_Apis()
+
+
+def map_sort_type(value: str) -> int:
+    return {
+        "general": 0,
+        "time_descending": 1,
+        "popularity_descending": 2,
+        "comment_descending": 3,
+        "collect_descending": 4,
+    }.get((value or "").strip(), 0)
+
+
+def map_note_type(value: str) -> int:
+    return {
+        "all": 0,
+        "video": 1,
+        "normal": 2,
+    }.get((value or "").strip(), 0)
+
+
+def map_time_range(value: str) -> int:
+    return {
+        "all": 0,
+        "day": 1,
+        "week": 2,
+        "half_year": 3,
+    }.get((value or "").strip(), 0)
+
+
+def to_search_item_payload(item: dict) -> dict:
+    raw_payload = item.raw_payload or {}
+    return {
+        "post_id": item.get("note_id", ""),
+        "post_url": item.get("note_url", ""),
+        "title": item.get("title", ""),
+        "author_name": item.get("nickname", ""),
+        "author_id": item.get("user_id", ""),
+        "content_preview": item.get("desc", ""),
+        "content": item.get("desc", ""),
+        "note_type": item.get("note_type", ""),
+        "topics": item.get("tags", []),
+        "image_urls": item.get("image_list", []),
+        "video_url": item.get("video_addr", ""),
+        "video_cover_url": item.get("video_cover", ""),
+        "like_count": item.get("liked_count", 0),
+        "comment_count": item.get("comment_count", 0),
+        "collect_count": item.get("collected_count", 0),
+        "publish_time": item.get("upload_time", ""),
+    }
+
+
+def normalize_preview_text(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (int, float)):
+        return str(value).strip()
+    if isinstance(value, list):
+        parts = [normalize_preview_text(item) for item in value]
+        return " ".join(item for item in parts if item).strip()
+    if isinstance(value, dict):
+        for key in ("text", "content", "title", "desc", "name", "value"):
+            text = normalize_preview_text(value.get(key))
+            if text:
+                return text
+        parts = [normalize_preview_text(item) for item in value.values()]
+        return " ".join(item for item in parts if item).strip()
+    return str(value).strip()
+
+
+def first_non_blank_text(*values) -> str:
+    for value in values:
+        text = normalize_preview_text(value)
+        if text:
+            return text
+    return ""
+
+
+def safe_int(value) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def build_title_fallback(content: str) -> str:
+    text = normalize_preview_text(content).replace("\n", " ").strip()
+    if not text:
+        return "无标题"
+    return text[:30]
+
+
+def extract_image_urls(note_card: dict) -> list[str]:
+    image_list = []
+    for image in note_card.get("image_list") or []:
+        if not isinstance(image, dict):
+            continue
+        info_list = image.get("info_list") or []
+        for info in reversed(info_list):
+            url = first_non_blank_text(info.get("url") if isinstance(info, dict) else "")
+            if url:
+                image_list.append(url)
+                break
+    return image_list
+
+
+def extract_cover_url(note_card: dict, image_urls: list[str]) -> str:
+    cover = note_card.get("cover") or {}
+    return first_non_blank_text(
+        cover.get("url") if isinstance(cover, dict) else "",
+        cover.get("default") if isinstance(cover, dict) else "",
+        image_urls[0] if image_urls else "",
+    )
+
+
+def extract_topics(note_card: dict, raw_item: dict) -> list[str]:
+    topics: list[str] = []
+    for source in (
+        note_card.get("tag_list"),
+        note_card.get("topic_list"),
+        note_card.get("desc_extra"),
+        note_card.get("at_desc"),
+        raw_item.get("tag_list"),
+        raw_item.get("topic_list"),
+        raw_item.get("topics"),
+        raw_item.get("body_topic_list"),
+    ):
+        if not source:
+            continue
+        if isinstance(source, list):
+            for item in source:
+                if isinstance(item, dict):
+                    name = first_non_blank_text(
+                        item.get("name"),
+                        item.get("text"),
+                        item.get("title"),
+                        item.get("topic_name"),
+                        item.get("tag_name"),
+                        item.get("hashtag_name"),
+                    )
+                else:
+                    name = first_non_blank_text(item)
+                if name and name not in topics:
+                    topics.append(name)
+    return topics
+
+
+def extract_video_urls(note_card: dict, image_urls: list[str]) -> tuple[str, str]:
+    video_info = note_card.get("video") or {}
+    streams = (((video_info.get("media") or {}).get("stream") or {}).get("h264") or [])
+    video_url = ""
+    for stream in streams:
+        if not isinstance(stream, dict):
+            continue
+        video_url = first_non_blank_text(stream.get("master_url"), stream.get("url"))
+        if video_url:
+            break
+    if not video_url and "consumer" in video_info:
+        origin_key = ((video_info.get("consumer") or {}).get("origin_video_key")) or ""
+        if origin_key:
+            video_url = f"https://sns-video-bd.xhscdn.com/{origin_key}"
+    video_cover_url = image_urls[0] if image_urls else ""
+    return video_url, video_cover_url
+
+
+def extract_content(raw_item: dict, note_card: dict) -> str:
+    basic_info = raw_item.get("basic_info") or {}
+    return first_non_blank_text(
+        note_card.get("desc"),
+        note_card.get("display_desc"),
+        note_card.get("content"),
+        note_card.get("note_abstract"),
+        basic_info.get("desc"),
+        raw_item.get("desc"),
+        raw_item.get("display_desc"),
+        raw_item.get("content"),
+        raw_item.get("note_abstract"),
+    )
+
+
+def build_search_post_url(raw_item: dict) -> str:
+    note_id = first_non_blank_text(raw_item.get("id"))
+    direct_url = first_non_blank_text(raw_item.get("url"))
+    if direct_url:
+        return direct_url
+    if not note_id:
+        return ""
+    xsec_token = first_non_blank_text(raw_item.get("xsec_token"))
+    xsec_source = first_non_blank_text(raw_item.get("xsec_source")) or "pc_search"
+    if xsec_token:
+        return f"https://www.xiaohongshu.com/explore/{note_id}?xsec_token={xsec_token}&xsec_source={xsec_source}"
+    return f"https://www.xiaohongshu.com/explore/{note_id}"
+
+
+def summarize_raw_note_fields(raw_item: dict) -> dict:
+    note_card = raw_item.get("note_card") or {}
+    basic_info = raw_item.get("basic_info") or {}
+    return {
+        "post_id": first_non_blank_text(raw_item.get("id")),
+        "raw_keys": sorted(raw_item.keys()),
+        "note_card_keys": sorted(note_card.keys()) if isinstance(note_card, dict) else [],
+        "basic_info_keys": sorted(basic_info.keys()) if isinstance(basic_info, dict) else [],
+        "title_fields": {
+            "note_card.title": first_non_blank_text(note_card.get("title")),
+            "note_card.display_title": first_non_blank_text(note_card.get("display_title")),
+            "raw.title": first_non_blank_text(raw_item.get("title")),
+        },
+        "content_fields": {
+            "note_card.desc": first_non_blank_text(note_card.get("desc")),
+            "note_card.display_desc": first_non_blank_text(note_card.get("display_desc")),
+            "note_card.content": first_non_blank_text(note_card.get("content")),
+            "basic_info.desc": first_non_blank_text(basic_info.get("desc")),
+            "raw.desc": first_non_blank_text(raw_item.get("desc")),
+        },
+        "topic_sources": {
+            "note_card.tag_list_count": len(note_card.get("tag_list") or []),
+            "note_card.topic_list_count": len(note_card.get("topic_list") or []),
+            "note_card.desc_extra_count": len(note_card.get("desc_extra") or []),
+            "raw.body_topic_list_count": len(raw_item.get("body_topic_list") or []),
+        },
+    }
+
+
+def build_detail_url_candidates(post_url: str) -> list[str]:
+    from urllib.parse import parse_qs, urlparse
+
+    parsed = urlparse(post_url.strip())
+    note_id = parsed.path.split("/")[-1] if parsed.path else ""
+    xsec_token = parse_qs(parsed.query).get("xsec_token", [""])[-1]
+    if not note_id:
+        return [post_url.strip()] if post_url.strip() else []
+
+    candidates: list[str] = []
+    if xsec_token:
+        for xsec_source in ("pc_search", "pc_user", "pc_feed"):
+            candidates.append(f"https://www.xiaohongshu.com/explore/{note_id}?xsec_token={xsec_token}&xsec_source={xsec_source}")
+    candidates.append(f"https://www.xiaohongshu.com/explore/{note_id}")
+
+    deduped: list[str] = []
+    for candidate in candidates:
+        if candidate and candidate not in deduped:
+            deduped.append(candidate)
+    return deduped
+
+
+def to_search_preview_item(raw_item: dict) -> dict:
+    note_card = raw_item.get("note_card") or {}
+    user = note_card.get("user") or {}
+    interact_info = note_card.get("interact_info") or {}
+    title = first_non_blank_text(
+        note_card.get("title"),
+        note_card.get("display_title"),
+        note_card.get("note_title"),
+        raw_item.get("title"),
+        raw_item.get("display_title"),
+        raw_item.get("note_title"),
+    )
+    content_preview = extract_content(raw_item, note_card)
+    title = title or build_title_fallback(content_preview)
+    author_name = first_non_blank_text(
+        user.get("nickname"),
+        user.get("nick_name"),
+        raw_item.get("nickname"),
+        raw_item.get("author_name"),
+    )
+    author_id = first_non_blank_text(
+        user.get("user_id"),
+        user.get("userid"),
+        raw_item.get("user_id"),
+        raw_item.get("author_id"),
+    )
+    image_urls = extract_image_urls(note_card)
+    cover_url = extract_cover_url(note_card, image_urls)
+    video_url, video_cover_url = extract_video_urls(note_card, image_urls)
+    topics = extract_topics(note_card, raw_item)
+    note_type = first_non_blank_text(note_card.get("type"), raw_item.get("type"))
+    return {
+        "post_id": raw_item.get("id", ""),
+        "post_url": build_search_post_url(raw_item),
+        "title": title,
+        "author_name": author_name,
+        "author_id": author_id,
+        "content_preview": content_preview,
+        "content": content_preview,
+        "note_type": note_type,
+        "topics": topics,
+        "cover_url": cover_url,
+        "image_urls": image_urls,
+        "video_url": video_url,
+        "video_cover_url": video_cover_url,
+        "like_count": safe_int(interact_info.get("liked_count")),
+        "comment_count": safe_int(interact_info.get("comment_count")),
+        "collect_count": safe_int(interact_info.get("collected_count")),
+        "publish_time": note_card.get("time", ""),
+    }
+
+
+def to_search_post_detail(raw_item: dict) -> dict:
+    note_card = raw_item.get("note_card") or {}
+    user = note_card.get("user") or {}
+    interact_info = note_card.get("interact_info") or {}
+    content = extract_content(raw_item, note_card)
+    raw_title = first_non_blank_text(
+        note_card.get("title"),
+        note_card.get("display_title"),
+        note_card.get("note_title"),
+        raw_item.get("title"),
+        raw_item.get("display_title"),
+        raw_item.get("note_title"),
+    )
+    title = build_title_fallback(content) if raw_title == "无标题" else (raw_title or build_title_fallback(content))
+    image_urls = extract_image_urls(note_card)
+    cover_url = extract_cover_url(note_card, image_urls)
+    video_url, video_cover_url = extract_video_urls(note_card, image_urls)
+    topics = extract_topics(note_card, raw_item)
+    return {
+        "post_id": first_non_blank_text(raw_item.get("id")),
+        "post_url": build_search_post_url(raw_item),
+        "title": title,
+        "author_name": first_non_blank_text(user.get("nickname"), user.get("nick_name"), raw_item.get("author_name")),
+        "author_id": first_non_blank_text(user.get("user_id"), user.get("userid"), raw_item.get("author_id")),
+        "content_preview": content[:120],
+        "content": content,
+        "note_type": first_non_blank_text(note_card.get("type"), raw_item.get("type")),
+        "topics": topics,
+        "cover_url": cover_url,
+        "image_urls": image_urls,
+        "video_url": video_url,
+        "video_cover_url": video_cover_url,
+        "like_count": safe_int(interact_info.get("liked_count")),
+        "comment_count": safe_int(interact_info.get("comment_count")),
+        "collect_count": safe_int(interact_info.get("collected_count")),
+        "publish_time": first_non_blank_text(note_card.get("time"), raw_item.get("publish_time")),
+    }
+
+
+def cleanup_login_sessions() -> None:
+    expire_before = utc_now() - timedelta(seconds=LOGIN_SESSION_TTL_SECONDS)
+    expired_keys = [key for key, value in LOGIN_SESSION_STORE.items() if value["created_at"] <= expire_before]
+    for key in expired_keys:
+        LOGIN_SESSION_STORE.pop(key, None)
+
+
+def get_login_session(login_session_id: str) -> dict:
+    cleanup_login_sessions()
+    item = LOGIN_SESSION_STORE.get(login_session_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="登录会话不存在或已过期")
+    return item
+
+
+def qr_code_data_url(content: str) -> str:
+    qr = qrcode.QRCode(border=2, box_size=8)
+    qr.add_data(content)
+    qr.make(fit=True)
+    image = qr.make_image(image_factory=qrcode.image.svg.SvgPathImage)
+    buffer = BytesIO()
+    image.save(buffer)
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:image/svg+xml;base64,{encoded}"
+
+
+def upsert_primary_account_from_login(
+    session: Session,
+    *,
+    account_id: str,
+    phone: str,
+    cookies_str: str,
+    nickname: str,
+) -> Account:
+    if account_id:
+        account = require_account(session, account_id, "primary")
+        account.cookies = cookies_str
+        account.cookie_preview = mask_cookie(cookies_str)
+        account.nickname = nickname.strip()
+        account.status = "active"
+        account.last_check_at = utc_now()
+        if not account.name.strip():
+            account.name = nickname.strip() or phone
+        write_audit_log(
+            session,
+            log_type="manual_action",
+            operator_type="app",
+            operator_id="android_app",
+            target_type="account",
+            target_id=account.id,
+            message="App 手机号验证码登录更新主账号",
+            payload={"phone": phone},
+        )
+        return account
+
+    account = Account(
+        account_type="primary",
+        name=nickname.strip() or phone,
+        nickname=nickname.strip(),
+        cookies=cookies_str,
+        cookie_preview=mask_cookie(cookies_str),
+        status="active",
+        remark="App 手机号验证码登录创建",
+        last_check_at=utc_now(),
+    )
+    session.add(account)
+    write_audit_log(
+        session,
+        log_type="manual_action",
+        operator_type="app",
+        operator_id="android_app",
+        target_type="account",
+        target_id=account.id,
+        message="App 手机号验证码登录创建主账号",
+        payload={"phone": phone},
+    )
+    return account
+
+
+def create_worker_account_from_login(
+    session: Session,
+    *,
+    cookies_str: str,
+    nickname: str,
+    name: str,
+    group_name: str,
+    remark: str,
+    usage_tags: list[str],
+    operator_id: str,
+    source_message: str,
+) -> Account:
+    display_name = name.strip() or nickname.strip() or "小号账号"
+    worker = Account(
+        account_type="worker",
+        name=display_name,
+        nickname=nickname.strip(),
+        cookies=cookies_str,
+        cookie_preview=mask_cookie(cookies_str),
+        status="active",
+        group_name=group_name.strip(),
+        remark=remark.strip(),
+        last_check_at=utc_now(),
+    )
+    session.add(worker)
+    session.flush()
+    set_usage_tags(session, worker, usage_tags)
+    write_audit_log(
+        session,
+        log_type="manual_action",
+        operator_type="web",
+        operator_id=operator_id,
+        target_type="account",
+        target_id=worker.id,
+        message=source_message,
+        payload={"group_name": worker.group_name, "usage_tags": usage_tags},
+    )
+    return worker
 
 
 def ensure_device(session: Session, payload: AppHeartbeatRequest, request: Request | None = None) -> Device:
@@ -706,7 +1308,7 @@ def search_task_due(task: SearchTask) -> bool:
     return task.last_run_at <= utc_now() - timedelta(minutes=task.interval_minutes)
 
 
-def claim_search_task(session: Session, device_id: str) -> tuple[SearchTask, Account] | None:
+def claim_search_task(session: Session, device_id: str) -> tuple[SearchTask, Account | None] | None:
     reclaim_expired_claims(session)
     if device_has_active_task(session, device_id):
         raise HTTPException(status_code=409, detail="当前设备已有运行中任务")
@@ -715,21 +1317,19 @@ def claim_search_task(session: Session, device_id: str) -> tuple[SearchTask, Acc
         if not search_task_due(task):
             continue
         worker = choose_worker(session, usage_tag="worker_search", group_name=task.group_name)
-        if not worker:
-            continue
         task.task_status = "claimed"
         task.claimed_by_device_id = device_id
-        task.assigned_worker_account_id = worker.id
+        task.assigned_worker_account_id = worker.id if worker else None
         task.claim_expires_at = utc_now() + timedelta(minutes=CLAIM_TIMEOUT_MINUTES)
         write_audit_log(
             session,
-            log_type="cookie_assign",
-            operator_type="system",
-            operator_id="system",
+            log_type="cookie_assign" if worker else "task_claim",
+            operator_type="system" if worker else "app",
+            operator_id="system" if worker else device_id,
             target_type="search_task",
             target_id=task.id,
-            message="搜索任务已分配小号",
-            payload={"worker_account_id": worker.id},
+            message="搜索任务已分配小号" if worker else "搜索任务已领取",
+            payload={"worker_account_id": worker.id if worker else ""},
         )
         return task, worker
     return None
@@ -852,6 +1452,94 @@ def sync_primary_cookie(payload: PrimaryCookieSync, session: Session = Depends(g
     return {"account": to_account_public(account)}
 
 
+@app.post("/api/app/auth/request-sms-code")
+def app_request_sms_code(payload: AppSmsCodeRequest) -> dict:
+    login_api = get_pc_login_api()
+    cookies = login_api.generate_init_cookies()
+    success, message, detail = login_api.send_phone_code(payload.phone.strip(), cookies, payload.zone.strip())
+    if not success:
+        raise HTTPException(status_code=502, detail=message or "发送验证码失败")
+    login_session_id = uuid4().hex
+    LOGIN_SESSION_STORE[login_session_id] = {
+        "phone": payload.phone.strip(),
+        "zone": payload.zone.strip(),
+        "cookies": cookies,
+        "created_at": utc_now(),
+    }
+    return {
+        "success": True,
+        "message": message or "验证码已发送",
+        "login_session_id": login_session_id,
+        "expires_in_seconds": LOGIN_SESSION_TTL_SECONDS,
+        "detail": detail,
+    }
+
+
+@app.post("/api/app/auth/login-with-sms")
+def app_login_with_sms(payload: AppSmsLoginRequest, session: Session = Depends(get_db)) -> dict:
+    login_session = get_login_session(payload.login_session_id)
+    phone = payload.phone.strip()
+    zone = payload.zone.strip()
+    if login_session["phone"] != phone or login_session["zone"] != zone:
+        raise HTTPException(status_code=400, detail="登录手机号或区号与验证码会话不匹配")
+
+    login_api = get_pc_login_api()
+    success, message, result = login_api.login_by_phone(phone, payload.code.strip(), login_session["cookies"], zone)
+    if not success:
+        raise HTTPException(status_code=502, detail=message or "验证码登录失败")
+
+    cookies = result["cookies"]
+    user_ok, user_info, cookies = login_api.get_user_info(cookies)
+    cookies_str = login_api.cookies_to_str(cookies)
+    nickname = ""
+    if user_ok:
+        nickname = (user_info or {}).get("nickname", "") or (user_info or {}).get("red_id", "")
+
+    account = upsert_primary_account_from_login(
+        session,
+        account_id=payload.account_id.strip(),
+        phone=phone,
+        cookies_str=cookies_str,
+        nickname=nickname,
+    )
+    session.commit()
+    session.refresh(account)
+    LOGIN_SESSION_STORE.pop(payload.login_session_id, None)
+    return {
+        "success": True,
+        "message": message or "登录成功",
+        "cookies": cookies_str,
+        "account": to_account_public(account),
+        "account_summary": to_account_summary(account),
+        "user_info": user_info if user_ok else {},
+    }
+
+
+@app.get("/api/app/accounts/{account_id}/summary")
+def app_account_summary(account_id: str, session: Session = Depends(get_db)) -> dict:
+    account = require_account(session, account_id, "primary")
+    return {"account": to_account_summary(account)}
+
+
+@app.post("/api/app/accounts/{account_id}/check")
+def app_check_account_summary(account_id: str, session: Session = Depends(get_db)) -> dict:
+    account = require_account(session, account_id, "primary")
+    ok, message = validate_cookie(account)
+    account.last_check_at = utc_now()
+    if ok:
+        account.status = "active"
+        mark_account_success(account)
+    else:
+        mark_account_failure(account, message)
+    session.commit()
+    session.refresh(account)
+    return {
+        "success": ok,
+        "message": message,
+        "account": to_account_summary(account),
+    }
+
+
 @app.get("/api/cookie-workers")
 def list_cookie_workers(session: Session = Depends(get_db)) -> dict:
     stmt = (
@@ -865,27 +1553,16 @@ def list_cookie_workers(session: Session = Depends(get_db)) -> dict:
 
 @app.post("/api/cookie-workers")
 def create_cookie_worker(payload: WorkerCookieCreate, session: Session = Depends(get_db)) -> dict:
-    worker = Account(
-        account_type="worker",
-        name=payload.name.strip(),
-        cookies=payload.cookies.strip(),
-        cookie_preview=mask_cookie(payload.cookies),
-        status="active",
-        group_name=payload.group_name.strip(),
-        remark=payload.remark.strip(),
-    )
-    session.add(worker)
-    session.flush()
-    set_usage_tags(session, worker, payload.usage_tags)
-    write_audit_log(
+    worker = create_worker_account_from_login(
         session,
-        log_type="manual_action",
-        operator_type="web",
+        cookies_str=payload.cookies.strip(),
+        nickname="",
+        name=payload.name,
+        group_name=payload.group_name,
+        remark=payload.remark,
+        usage_tags=payload.usage_tags,
         operator_id="web",
-        target_type="account",
-        target_id=worker.id,
-        message="创建小号 Cookie",
-        payload={"group_name": worker.group_name},
+        source_message="创建小号 Cookie",
     )
     session.commit()
     session.refresh(worker)
@@ -931,6 +1608,150 @@ def check_cookie_worker(worker_id: str, session: Session = Depends(get_db)) -> d
     session.commit()
     session.refresh(worker)
     return {"success": ok, "message": message, "worker_cookie": to_account_public(worker)}
+
+
+@app.post("/api/cookie-workers/auth/request-sms-code")
+def request_worker_sms_code(payload: WorkerSmsCodeRequest) -> dict:
+    login_api = get_pc_login_api()
+    cookies = login_api.generate_init_cookies()
+    success, message, detail = login_api.send_phone_code(payload.phone.strip(), cookies, payload.zone.strip())
+    if not success:
+        raise HTTPException(status_code=502, detail=message or "发送验证码失败")
+    login_session_id = uuid4().hex
+    LOGIN_SESSION_STORE[login_session_id] = {
+        "account_type": "worker",
+        "method": "sms",
+        "phone": payload.phone.strip(),
+        "zone": payload.zone.strip(),
+        "cookies": cookies,
+        "draft": payload.model_dump(),
+        "created_at": utc_now(),
+    }
+    return {
+        "success": True,
+        "message": message or "验证码已发送",
+        "login_session_id": login_session_id,
+        "expires_in_seconds": LOGIN_SESSION_TTL_SECONDS,
+        "detail": detail,
+    }
+
+
+@app.post("/api/cookie-workers/auth/login-with-sms")
+def login_worker_with_sms(payload: WorkerSmsLoginRequest, session: Session = Depends(get_db)) -> dict:
+    login_session = get_login_session(payload.login_session_id)
+    if login_session.get("account_type") != "worker" or login_session.get("method") != "sms":
+        raise HTTPException(status_code=400, detail="登录会话类型不匹配")
+    phone = payload.phone.strip()
+    zone = payload.zone.strip()
+    if login_session["phone"] != phone or login_session["zone"] != zone:
+        raise HTTPException(status_code=400, detail="登录手机号或区号与验证码会话不匹配")
+
+    login_api = get_pc_login_api()
+    success, message, result = login_api.login_by_phone(phone, payload.code.strip(), login_session["cookies"], zone)
+    if not success:
+        raise HTTPException(status_code=502, detail=message or "验证码登录失败")
+
+    cookies = result["cookies"]
+    user_ok, user_info, cookies = login_api.get_user_info(cookies)
+    cookies_str = login_api.cookies_to_str(cookies)
+    nickname = ""
+    if user_ok:
+        nickname = (user_info or {}).get("nickname", "") or (user_info or {}).get("red_id", "")
+    worker = create_worker_account_from_login(
+        session,
+        cookies_str=cookies_str,
+        nickname=nickname,
+        name=payload.name,
+        group_name=payload.group_name,
+        remark=payload.remark or "手机号验证码登录创建",
+        usage_tags=payload.usage_tags,
+        operator_id="web_sms",
+        source_message="手机号验证码登录创建小号",
+    )
+    session.commit()
+    session.refresh(worker)
+    LOGIN_SESSION_STORE.pop(payload.login_session_id, None)
+    return {
+        "success": True,
+        "message": message or "登录成功",
+        "worker_cookie": to_account_public(worker),
+        "user_info": user_info if user_ok else {},
+    }
+
+
+@app.post("/api/cookie-workers/auth/request-qrcode")
+def request_worker_qrcode(payload: WorkerQrCodeRequest) -> dict:
+    login_api = get_pc_login_api()
+    cookies = login_api.generate_init_cookies()
+    success, message, qr_data = login_api.generate_qrcode(cookies)
+    if not success or not qr_data:
+        raise HTTPException(status_code=502, detail=message or "生成二维码失败")
+    login_session_id = uuid4().hex
+    LOGIN_SESSION_STORE[login_session_id] = {
+        "account_type": "worker",
+        "method": "qrcode",
+        "cookies": qr_data["cookies"],
+        "qr_id": qr_data["qr_id"],
+        "qr_code": qr_data["code"],
+        "qr_url": qr_data["qr_url"],
+        "draft": payload.model_dump(),
+        "created_at": utc_now(),
+    }
+    return {
+        "success": True,
+        "message": "二维码已生成",
+        "login_session_id": login_session_id,
+        "expires_in_seconds": LOGIN_SESSION_TTL_SECONDS,
+        "qr_url": qr_data["qr_url"],
+        "qr_data_url": qr_code_data_url(qr_data["qr_url"]),
+    }
+
+
+@app.post("/api/cookie-workers/auth/check-qrcode")
+def check_worker_qrcode(payload: WorkerQrCodeCheckRequest, session: Session = Depends(get_db)) -> dict:
+    login_session = get_login_session(payload.login_session_id)
+    if login_session.get("account_type") != "worker" or login_session.get("method") != "qrcode":
+        raise HTTPException(status_code=400, detail="登录会话类型不匹配")
+
+    login_api = get_pc_login_api()
+    success, message, cookies = login_api.check_qrcode_status(
+        login_session["qr_id"],
+        login_session["qr_code"],
+        login_session["cookies"],
+    )
+    login_session["cookies"] = cookies
+    if not success:
+        return {
+            "success": False,
+            "message": message,
+            "login_session_id": payload.login_session_id,
+        }
+
+    user_ok, user_info, cookies = login_api.get_user_info(cookies)
+    cookies_str = login_api.cookies_to_str(cookies)
+    nickname = ""
+    if user_ok:
+        nickname = (user_info or {}).get("nickname", "") or (user_info or {}).get("red_id", "")
+    worker = create_worker_account_from_login(
+        session,
+        cookies_str=cookies_str,
+        nickname=nickname,
+        name=payload.name,
+        group_name=payload.group_name,
+        remark=payload.remark or "扫码登录创建",
+        usage_tags=payload.usage_tags,
+        operator_id="web_qrcode",
+        source_message="扫码登录创建小号",
+    )
+    session.commit()
+    session.refresh(worker)
+    LOGIN_SESSION_STORE.pop(payload.login_session_id, None)
+    return {
+        "success": True,
+        "message": message or "扫码登录成功",
+        "worker_cookie": to_account_public(worker),
+        "user_info": user_info if user_ok else {},
+    }
 
 
 @app.post("/api/app/heartbeat")
@@ -1184,10 +2005,187 @@ def create_search_task(payload: SearchTaskCreate, session: Session = Depends(get
     return {"task": to_search_task(task)}
 
 
+@app.post("/api/app/search-tasks")
+def app_create_search_task(payload: AppSearchTaskCreate, session: Session = Depends(get_db)) -> dict:
+    task = SearchTask(
+        keyword=payload.keyword.strip(),
+        group_name=payload.group_name.strip(),
+        require_num=payload.require_num,
+        sort_type=payload.sort_type.strip(),
+        note_type=payload.note_type.strip(),
+        time_range=payload.time_range.strip(),
+        interval_minutes=payload.interval_minutes,
+        enabled=payload.enabled,
+        task_status="pending",
+        max_retry=payload.max_retry,
+    )
+    session.add(task)
+    write_audit_log(
+        session,
+        log_type="manual_action",
+        operator_type="app",
+        operator_id=payload.device_id or payload.app_instance_id or "app",
+        target_type="search_task",
+        target_id=task.id,
+        message="App 创建关键词搜索任务",
+        payload={"group_name": task.group_name},
+    )
+    session.commit()
+    session.refresh(task)
+    return {"task": to_search_task(task)}
+
+
+@app.post("/api/app/search-preview")
+def app_search_preview(payload: AppDirectSearchRequest, session: Session = Depends(get_db)) -> dict:
+    account = require_account(session, payload.account_id, "primary")
+    ok, message = validate_cookie(account)
+    account.last_check_at = utc_now()
+    if not ok:
+        mark_account_failure(account, message)
+        session.commit()
+        raise HTTPException(status_code=400, detail=message)
+
+    api = get_pc_content_api()
+    success, search_message, notes = api.search_some_note(
+        payload.keyword.strip(),
+        payload.require_num,
+        account.cookies,
+        sort_type_choice=map_sort_type(payload.sort_type),
+        note_type=map_note_type(payload.note_type),
+        note_time=map_time_range(payload.time_range),
+    )
+    if not success:
+        mark_account_failure(account, search_message)
+        session.commit()
+        raise HTTPException(status_code=502, detail=search_message or "搜索失败")
+
+    mark_account_success(account)
+    results = [to_search_preview_item(item) for item in notes if item.get("id")]
+    if notes:
+        logger.info(
+            "search-preview keyword={} count={} first_raw={}",
+            payload.keyword.strip(),
+            len(results),
+            summarize_raw_note_fields(notes[0]),
+        )
+        logger.info(
+            "search-preview first_parsed={}",
+            {
+                "post_id": results[0].get("post_id", "") if results else "",
+                "title": results[0].get("title", "") if results else "",
+                "content_preview": results[0].get("content_preview", "") if results else "",
+                "topics": results[0].get("topics", []) if results else [],
+                "image_count": len(results[0].get("image_urls", [])) if results else 0,
+                "has_video": bool(results[0].get("video_url")) if results else False,
+            },
+        )
+    write_audit_log(
+        session,
+        log_type="app_result",
+        operator_type="app",
+        operator_id=payload.account_id,
+        target_type="search_task",
+        target_id="direct_search",
+        message="App 即时搜索",
+        payload={"keyword": payload.keyword.strip(), "count": len(results)},
+    )
+    session.commit()
+    return {
+        "keyword": payload.keyword.strip(),
+        "post_count": len(results),
+        "results": results,
+    }
+
+
+@app.post("/api/app/search-post-detail")
+def app_search_post_detail(payload: AppSearchPostDetailRequest, session: Session = Depends(get_db)) -> dict:
+    account = require_account(session, payload.account_id, "primary")
+    ok, message = validate_cookie(account)
+    account.last_check_at = utc_now()
+    if not ok:
+        mark_account_failure(account, message)
+        session.commit()
+        raise HTTPException(status_code=400, detail=message)
+
+    api = get_pc_content_api()
+    success = False
+    detail_message = ""
+    res_json = None
+    attempts = []
+    for candidate_url in build_detail_url_candidates(payload.post_url.strip()):
+        attempt_success, attempt_message, attempt_json = api.get_note_info(candidate_url, account.cookies)
+        attempts.append({"url": candidate_url, "success": attempt_success, "message": attempt_message})
+        if attempt_success:
+            success = True
+            detail_message = attempt_message
+            res_json = attempt_json
+            break
+        detail_message = attempt_message
+    if not success:
+        logger.warning("search-post-detail attempts={}", attempts)
+        mark_account_failure(account, detail_message)
+        session.commit()
+        raise HTTPException(status_code=502, detail=detail_message or "获取帖子详情失败")
+
+    items = (((res_json or {}).get("data") or {}).get("items") or [])
+    if not items:
+        session.commit()
+        raise HTTPException(status_code=404, detail="帖子详情不存在")
+
+    mark_account_success(account)
+    detail = to_search_post_detail(items[0])
+    logger.info("search-post-detail attempts={}", attempts)
+    logger.info("search-post-detail raw={}", summarize_raw_note_fields(items[0]))
+    logger.info(
+        "search-post-detail parsed={}",
+        {
+            "post_id": detail.get("post_id", ""),
+            "title": detail.get("title", ""),
+            "content": detail.get("content", ""),
+            "topics": detail.get("topics", []),
+            "image_count": len(detail.get("image_urls", [])),
+            "video_url": detail.get("video_url", ""),
+        },
+    )
+    write_audit_log(
+        session,
+        log_type="app_result",
+        operator_type="app",
+        operator_id=payload.account_id,
+        target_type="search_task",
+        target_id="post_detail",
+        message="App 查看帖子详情",
+        payload={"post_id": detail.get("post_id"), "post_url": payload.post_url.strip()},
+    )
+    session.commit()
+    return {"detail": detail}
+
+
 @app.get("/api/search-tasks")
 def list_search_tasks(session: Session = Depends(get_db)) -> dict:
     stmt = select(SearchTask).order_by(SearchTask.created_at.desc())
     return {"tasks": [to_search_task(item) for item in session.execute(stmt).scalars().all()]}
+
+
+@app.get("/api/app/search-tasks")
+def app_list_search_tasks(session: Session = Depends(get_db)) -> dict:
+    stmt = select(SearchTask).order_by(SearchTask.created_at.desc())
+    tasks = session.execute(stmt).scalars().all()
+    result_counts = dict(
+        session.execute(
+            select(SearchResult.search_task_id, func.count(SearchResult.id))
+            .group_by(SearchResult.search_task_id)
+        ).all()
+    )
+    return {
+        "tasks": [
+            {
+                **to_search_task(item),
+                "post_count": result_counts.get(item.id, 0),
+            }
+            for item in tasks
+        ]
+    }
 
 
 @app.patch("/api/search-tasks/{task_id}")
@@ -1265,8 +2263,18 @@ def app_next_search_task(
         return {"task": None}
     task, worker = claimed
     body = to_search_task(task)
-    body["worker_cookie_id"] = worker.id
+    if worker:
+        body["worker_cookie_id"] = worker.id
     return {"task": body}
+
+
+@app.get("/api/app/search-tasks/{task_id}")
+def app_get_search_task_detail(task_id: str, session: Session = Depends(get_db)) -> dict:
+    task = session.get(SearchTask, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="关键词任务不存在")
+    stmt = select(SearchResult).where(SearchResult.search_task_id == task_id).order_by(SearchResult.created_at.desc())
+    return to_search_task_detail(task, session.execute(stmt).scalars().all())
 
 
 def handle_search_task_result(task_id: str, payload: SearchTaskResultRequest, session: Session) -> dict:
@@ -1288,7 +2296,7 @@ def handle_search_task_result(task_id: str, payload: SearchTaskResultRequest, se
     )
     saved_count = 0
     if created:
-        worker = require_account(session, payload.worker_cookie_id, "worker")
+        worker = require_account(session, payload.worker_cookie_id, "worker") if payload.worker_cookie_id else None
         task.claimed_by_device_id = ""
         task.claim_expires_at = None
         task.task_status = "pending"
@@ -1296,11 +2304,13 @@ def handle_search_task_result(task_id: str, payload: SearchTaskResultRequest, se
         task.last_error = payload.error_message
         if payload.error_message and not payload.items:
             task.retry_count += 1
-            mark_account_failure(worker, payload.error_message)
+            if worker:
+                mark_account_failure(worker, payload.error_message)
         else:
             task.last_success_at = utc_now()
             task.retry_count = 0
-            mark_account_success(worker)
+            if worker:
+                mark_account_success(worker)
         seen_post_ids: set[str] = set()
         for item in payload.items:
             if item.post_id in seen_post_ids:
@@ -1314,7 +2324,7 @@ def handle_search_task_result(task_id: str, payload: SearchTaskResultRequest, se
                 SearchResult(
                     search_task_id=task.id,
                     result_id=payload.result_id,
-                    worker_account_id=worker.id,
+                    worker_account_id=worker.id if worker else None,
                     post_id=item.post_id,
                     post_url=item.post_url,
                     title=item.title,
@@ -1605,7 +2615,8 @@ def app_next_task(
     if claimed_search:
         task, worker = claimed_search
         body = to_search_task(task)
-        body["worker_cookie_id"] = worker.id
+        if worker:
+            body["worker_cookie_id"] = worker.id
         session.commit()
         return {"task_type": "search", "task": body}
 

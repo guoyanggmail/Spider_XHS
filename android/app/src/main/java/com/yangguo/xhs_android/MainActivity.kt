@@ -11,10 +11,12 @@ import com.yangguo.xhs_android.ui.theme.XhsandroidTheme
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val configStore = AppConfigStore(this)
+        configStore.applySavedLanguage()
         enableEdgeToEdge()
         setContent {
             XhsandroidTheme {
-                AppScreen(configStore = AppConfigStore(this))
+                AppScreen(configStore = configStore)
             }
         }
     }

@@ -18,7 +18,7 @@
 结论：
 
 - 当前项目已经不是纯本地单用户小工具。
-- 后面会有 Web 管理后台、App 拉任务、任务状态流转、Cookie 池分配、日志审计。
+- 后面会有 Web 管理后台、App 拉发帖任务、App 创建搜索任务、任务状态流转、结果查询、日志审计。
 - 这些场景都更适合 PostgreSQL。
 
 不建议继续把核心数据放在 JSON 文件里。
@@ -47,7 +47,7 @@
 | 类型 | 存储方式 |
 |---|---|
 | 账号、Cookie 池、任务、结果、日志 | PostgreSQL |
-| 临时心跳缓存 | 可先内存，后续也可入库 |
+| App 最近活动 | 可由任务领取、任务创建和结果回传刷新，不要求独立心跳 |
 | 媒体文件本体 | 不入库，只存 URL 和元数据 |
 
 ### 3.2 敏感信息
@@ -64,7 +64,7 @@
 
 - 同一主账号同一时刻仅一个发帖任务处于 `claimed/running`
 - 同一设备同一时刻仅一个任务处于 `claimed/running`
-- 同一小号 Cookie 同一时刻仅服务一个运行中任务
+- 同一账号同一时刻仅服务一个运行中任务
 
 ## 4. 核心枚举
 
@@ -159,7 +159,7 @@
 
 ## 5.3 `devices`
 
-用途：App 设备注册与心跳。
+用途：App 实例标识和最近活动记录。独立心跳不是首期必需流程。
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
@@ -169,7 +169,7 @@
 | `device_name` | `varchar(100)` | 设备名 |
 | `app_version` | `varchar(50)` | App 版本 |
 | `status` | `varchar(20)` | `online/offline/disabled` |
-| `last_heartbeat_at` | `timestamptz` | 最近心跳 |
+| `last_heartbeat_at` | `timestamptz` | 兼容字段，可表示最近活动 |
 | `last_seen_ip` | `varchar(100)` | 可选 |
 | `created_at` | `timestamptz` | 创建时间 |
 | `updated_at` | `timestamptz` | 更新时间 |
@@ -216,7 +216,7 @@
 
 ## 5.5 `search_tasks`
 
-用途：关键词采集任务。
+用途：关键词搜索任务。首期由 App 创建，后台保存任务和结果。
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
@@ -231,7 +231,7 @@
 | `enabled` | `boolean` | 是否启用 |
 | `task_status` | `varchar(20)` | 当前状态 |
 | `claimed_by_device_id` | `varchar(100)` | 领取设备 |
-| `assigned_worker_account_id` | `uuid` FK | 分配的小号 |
+| `assigned_worker_account_id` | `uuid` FK | 可选，后续启用小号池时记录分配的小号 |
 | `claim_expires_at` | `timestamptz` | 领取过期时间 |
 | `last_run_at` | `timestamptz` | 最近执行时间 |
 | `last_success_at` | `timestamptz` | 最近成功时间 |
@@ -250,7 +250,7 @@
 | `id` | `uuid` PK | 主键 |
 | `search_task_id` | `uuid` FK | 任务 ID |
 | `result_id` | `varchar(100)` | App 回传结果 ID |
-| `worker_account_id` | `uuid` FK | 使用的小号 |
+| `worker_account_id` | `uuid` FK | 可选，后续启用小号池时记录使用的小号 |
 | `post_id` | `varchar(100)` | 帖子 ID |
 | `post_url` | `text` | 帖子链接 |
 | `title` | `varchar(300)` | 标题 |

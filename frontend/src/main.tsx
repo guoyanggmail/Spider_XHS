@@ -129,6 +129,20 @@ type AuditLog = {
   created_at: string;
 };
 
+type WorkerAuthMode = "cookie" | "sms" | "qrcode";
+
+type WorkerSmsSession = {
+  login_session_id: string;
+  expires_in_seconds: number;
+};
+
+type WorkerQrSession = {
+  login_session_id: string;
+  expires_in_seconds: number;
+  qr_url: string;
+  qr_data_url: string;
+};
+
 type TabKey =
   | "dashboard"
   | "primary"
@@ -196,7 +210,18 @@ function App() {
   const [logs, setLogs] = useState<AuditLog[]>([]);
 
   const [primaryForm, setPrimaryForm] = useState({ name: "", cookies: "", nickname: "", bound_device_id: "", remark: "" });
-  const [workerForm, setWorkerForm] = useState({ name: "", cookies: "", remark: "", usage_tags: "worker_search", group_name: "" });
+  const [workerForm, setWorkerForm] = useState({
+    name: "",
+    cookies: "",
+    remark: "",
+    usage_tags: "worker_search",
+    group_name: "",
+    phone: "",
+    code: ""
+  });
+  const [workerAuthMode, setWorkerAuthMode] = useState<WorkerAuthMode>("cookie");
+  const [workerSmsSession, setWorkerSmsSession] = useState<WorkerSmsSession | null>(null);
+  const [workerQrSession, setWorkerQrSession] = useState<WorkerQrSession | null>(null);
   const [publishForm, setPublishForm] = useState({
     account_id: "",
     title: "",
@@ -284,9 +309,106 @@ function App() {
             .filter(Boolean)
         })
       });
-      setWorkerForm({ name: "", cookies: "", remark: "", usage_tags: "worker_search", group_name: "" });
+      setWorkerForm({ name: "", cookies: "", remark: "", usage_tags: "worker_search", group_name: "", phone: "", code: "" });
+      setWorkerSmsSession(null);
+      setWorkerQrSession(null);
       setMessage("小号 Cookie 已创建");
       await loadAll();
+    } catch (error) {
+      setMessage((error as Error).message);
+    }
+  }
+
+  function workerDraftPayload() {
+    return {
+      name: workerForm.name,
+      remark: workerForm.remark,
+      group_name: workerForm.group_name,
+      usage_tags: workerForm.usage_tags
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean)
+    };
+  }
+
+  async function requestWorkerSmsCode() {
+    try {
+      const response = await api<WorkerSmsSession & { message: string }>("/api/cookie-workers/auth/request-sms-code", {
+        method: "POST",
+        body: JSON.stringify({
+          ...workerDraftPayload(),
+          phone: workerForm.phone,
+          zone: "86"
+        })
+      });
+      setWorkerSmsSession({
+        login_session_id: response.login_session_id,
+        expires_in_seconds: response.expires_in_seconds
+      });
+      setMessage(response.message || "验证码已发送");
+    } catch (error) {
+      setMessage((error as Error).message);
+    }
+  }
+
+  async function loginWorkerWithSms() {
+    try {
+      if (!workerSmsSession) throw new Error("请先获取验证码");
+      const response = await api<{ message: string; worker_cookie: Account }>("/api/cookie-workers/auth/login-with-sms", {
+        method: "POST",
+        body: JSON.stringify({
+          ...workerDraftPayload(),
+          login_session_id: workerSmsSession.login_session_id,
+          phone: workerForm.phone,
+          code: workerForm.code,
+          zone: "86"
+        })
+      });
+      setWorkerForm({ name: "", cookies: "", remark: "", usage_tags: "worker_search", group_name: "", phone: "", code: "" });
+      setWorkerSmsSession(null);
+      setWorkerQrSession(null);
+      setMessage(response.message || "小号已创建");
+      await loadAll();
+    } catch (error) {
+      setMessage((error as Error).message);
+    }
+  }
+
+  async function requestWorkerQrCode() {
+    try {
+      const response = await api<WorkerQrSession & { message: string }>("/api/cookie-workers/auth/request-qrcode", {
+        method: "POST",
+        body: JSON.stringify(workerDraftPayload())
+      });
+      setWorkerQrSession({
+        login_session_id: response.login_session_id,
+        expires_in_seconds: response.expires_in_seconds,
+        qr_url: response.qr_url,
+        qr_data_url: response.qr_data_url
+      });
+      setMessage(response.message || "二维码已生成");
+    } catch (error) {
+      setMessage((error as Error).message);
+    }
+  }
+
+  async function checkWorkerQrCode() {
+    try {
+      if (!workerQrSession) throw new Error("请先生成二维码");
+      const response = await api<{ success: boolean; message: string; worker_cookie?: Account }>("/api/cookie-workers/auth/check-qrcode", {
+        method: "POST",
+        body: JSON.stringify({
+          ...workerDraftPayload(),
+          login_session_id: workerQrSession.login_session_id
+        })
+      });
+      setMessage(response.message);
+      if (response.success) {
+        setWorkerForm({ name: "", cookies: "", remark: "", usage_tags: "worker_search", group_name: "", phone: "", code: "" });
+        setWorkerQrSession(null);
+        setWorkerSmsSession(null);
+        await loadAll();
+      }
     } catch (error) {
       setMessage((error as Error).message);
     }
@@ -404,6 +526,11 @@ function App() {
     }
   }
 
+  async function toggleWorker(account: Account) {
+    const nextStatus = account.status === "disabled" ? "active" : "disabled";
+    await updateWorker(account, nextStatus);
+  }
+
   async function toggleSearchTask(task: SearchTask) {
     try {
       await api(`/api/search-tasks/${task.id}`, {
@@ -456,8 +583,8 @@ function App() {
 
   async function checkPrimary(id: string) {
     try {
-      await api(`/api/accounts/primary/${id}/check`, { method: "POST" });
-      setMessage("主账号已校验");
+      const response = await api<{ success: boolean; message: string }>(`/api/accounts/primary/${id}/check`, { method: "POST" });
+      setMessage(response.message || "主账号已校验");
       await loadAll();
     } catch (error) {
       setMessage((error as Error).message);
@@ -466,8 +593,8 @@ function App() {
 
   async function checkWorker(id: string) {
     try {
-      await api(`/api/cookie-workers/${id}/check`, { method: "POST" });
-      setMessage("小号 Cookie 已校验");
+      const response = await api<{ success: boolean; message: string }>(`/api/cookie-workers/${id}/check`, { method: "POST" });
+      setMessage(response.message || "小号 Cookie 已校验");
       await loadAll();
     } catch (error) {
       setMessage((error as Error).message);
@@ -581,12 +708,62 @@ function App() {
           <div className="grid gap-6 lg:grid-cols-[360px,1fr]">
             <Card title="新增小号 Cookie">
               <form className="space-y-3" onSubmit={submitWorker}>
+                <div className="flex flex-wrap gap-2">
+                  {[
+                    ["cookie", "直接 Cookie"],
+                    ["sms", "验证码"],
+                    ["qrcode", "扫码"]
+                  ].map(([value, label]) => (
+                    <button
+                      key={value}
+                      type="button"
+                      onClick={() => setWorkerAuthMode(value as WorkerAuthMode)}
+                      className={`rounded-full px-3 py-1 text-sm ${
+                        workerAuthMode === value ? "bg-slate-900 text-white" : "border border-slate-300 bg-white text-slate-700"
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
                 <input className="w-full rounded-xl border px-3 py-2" placeholder="账号名称" value={workerForm.name} onChange={(e) => setWorkerForm({ ...workerForm, name: e.target.value })} />
                 <input className="w-full rounded-xl border px-3 py-2" placeholder="分组，如 brand_a" value={workerForm.group_name} onChange={(e) => setWorkerForm({ ...workerForm, group_name: e.target.value })} />
                 <input className="w-full rounded-xl border px-3 py-2" placeholder="用途标签，逗号分隔" value={workerForm.usage_tags} onChange={(e) => setWorkerForm({ ...workerForm, usage_tags: e.target.value })} />
-                <textarea className="h-32 w-full rounded-xl border px-3 py-2" placeholder="Worker Cookie" value={workerForm.cookies} onChange={(e) => setWorkerForm({ ...workerForm, cookies: e.target.value })} />
+                {workerAuthMode === "cookie" && (
+                  <textarea className="h-32 w-full rounded-xl border px-3 py-2" placeholder="Worker Cookie" value={workerForm.cookies} onChange={(e) => setWorkerForm({ ...workerForm, cookies: e.target.value })} />
+                )}
+                {workerAuthMode === "sms" && (
+                  <>
+                    <input className="w-full rounded-xl border px-3 py-2" placeholder="手机号" value={workerForm.phone} onChange={(e) => setWorkerForm({ ...workerForm, phone: e.target.value.replace(/\D/g, "").slice(0, 11) })} />
+                    <input className="w-full rounded-xl border px-3 py-2" placeholder="验证码" value={workerForm.code} onChange={(e) => setWorkerForm({ ...workerForm, code: e.target.value.replace(/\D/g, "").slice(0, 6) })} />
+                    {workerSmsSession ? <div className="text-xs text-slate-500">验证码会话已创建，{workerSmsSession.expires_in_seconds} 秒内有效</div> : null}
+                    <div className="flex flex-wrap gap-2">
+                      <button className="rounded-xl border px-4 py-2" type="button" onClick={requestWorkerSmsCode}>获取验证码</button>
+                      <button className="rounded-xl bg-slate-900 px-4 py-2 text-white" type="button" onClick={loginWorkerWithSms}>验证码登录并保存</button>
+                    </div>
+                  </>
+                )}
+                {workerAuthMode === "qrcode" && (
+                  <>
+                    <div className="flex flex-wrap gap-2">
+                      <button className="rounded-xl border px-4 py-2" type="button" onClick={requestWorkerQrCode}>生成二维码</button>
+                      <button className="rounded-xl bg-slate-900 px-4 py-2 text-white" type="button" onClick={checkWorkerQrCode}>检查扫码状态</button>
+                    </div>
+                    {workerQrSession ? (
+                      <div className="space-y-2 rounded-xl border border-slate-200 p-3">
+                        <img src={workerQrSession.qr_data_url} alt="扫码登录二维码" className="h-48 w-48 rounded-lg border border-slate-200 bg-white p-2" />
+                        <div className="text-xs text-slate-500">二维码有效期 {workerQrSession.expires_in_seconds} 秒</div>
+                        <a className="break-all text-xs text-sky-700 underline" href={workerQrSession.qr_url} target="_blank" rel="noreferrer">
+                          {workerQrSession.qr_url}
+                        </a>
+                      </div>
+                    ) : null}
+                  </>
+                )}
                 <textarea className="h-20 w-full rounded-xl border px-3 py-2" placeholder="备注" value={workerForm.remark} onChange={(e) => setWorkerForm({ ...workerForm, remark: e.target.value })} />
-                <button className="rounded-xl bg-slate-900 px-4 py-2 text-white" type="submit">保存小号</button>
+                {workerAuthMode === "cookie" ? (
+                  <button className="rounded-xl bg-slate-900 px-4 py-2 text-white" type="submit">保存小号</button>
+                ) : null}
               </form>
             </Card>
             <Card title="小号池列表">
@@ -603,9 +780,10 @@ function App() {
                         <div className="mt-1 text-xs text-slate-500">失败次数 {account.failure_count}</div>
                       </div>
                       <div className="flex flex-wrap gap-2">
-                        <button className="rounded-lg border px-3 py-1 text-sm" onClick={() => checkWorker(account.id)}>校验</button>
-                        <button className="rounded-lg border px-3 py-1 text-sm" onClick={() => updateWorker(account, "active")}>启用</button>
-                        <button className="rounded-lg border px-3 py-1 text-sm" onClick={() => updateWorker(account, "disabled")}>停用</button>
+                        <button className="rounded-lg border px-3 py-1 text-sm" type="button" onClick={() => checkWorker(account.id)}>校验</button>
+                        <button className="rounded-lg border px-3 py-1 text-sm" type="button" onClick={() => toggleWorker(account)}>
+                          {account.status === "disabled" ? "启用" : "停用"}
+                        </button>
                       </div>
                     </div>
                   </div>

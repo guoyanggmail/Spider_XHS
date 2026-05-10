@@ -43,7 +43,10 @@ datas/accounts.tmp
 datas/operations.json
 datas/operations.tmp
 datas/*.db
+datas/
 android/.gradle/
+android/.gradle-home/
 android/.idea/
+android/.kotlin/
 android/local.properties
 android/**/build/

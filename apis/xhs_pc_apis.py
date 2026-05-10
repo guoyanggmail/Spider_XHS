@@ -12,7 +12,10 @@ from loguru import logger
     :param cookies_str: 你的cookies
 """
 def _log_api_error(error):
-    logger.exception(f'XHS PC API request failed: {error}')
+    if isinstance(error, requests.exceptions.RequestException):
+        logger.warning(f'XHS PC API request failed: {error}')
+    else:
+        logger.exception(f'XHS PC API request failed: {error}')
     return str(error)
 
 
@@ -21,6 +24,37 @@ def _get_query_params(parsed_url):
         key: values[-1] if values else ''
         for key, values in urllib.parse.parse_qs(parsed_url.query, keep_blank_values=True).items()
     }
+
+
+def _normalize_proxies(proxies: dict | None):
+    if proxies is not None:
+        return proxies
+    return {"http": None, "https": None}
+
+
+def _post(url: str, *, headers: dict, data, cookies: dict, proxies: dict | None = None):
+    with requests.Session() as session:
+        session.trust_env = False
+        return session.post(
+            url,
+            headers=headers,
+            data=data,
+            cookies=cookies,
+            proxies=_normalize_proxies(proxies),
+            timeout=REQUEST_TIMEOUT,
+        )
+
+
+def _get(url: str, *, headers: dict, cookies: dict, proxies: dict | None = None):
+    with requests.Session() as session:
+        session.trust_env = False
+        return session.get(
+            url,
+            headers=headers,
+            cookies=cookies,
+            proxies=_normalize_proxies(proxies),
+            timeout=REQUEST_TIMEOUT,
+        )
 
 
 class XHS_Apis():
@@ -391,7 +425,7 @@ class XHS_Apis():
             headers, cookies, data = generate_request_params(cookies_str, api, data, 'POST')
             headers["x-rap-param"] = generate_x_rap_param(api, data)
             headers["xy-direction"] = "13"
-            response = requests.post(self.base_url + api, headers=headers, data=data, cookies=cookies, proxies=proxies, timeout=REQUEST_TIMEOUT)
+            response = _post(self.base_url + api, headers=headers, data=data, cookies=cookies, proxies=proxies)
             res_json = response.json()
             success, msg = res_json["success"], res_json["msg"]
         except Exception as e:
@@ -523,7 +557,13 @@ class XHS_Apis():
             }
             headers, cookies, data = generate_request_params(cookies_str, api, data, 'POST')
             headers["x-rap-param"] = generate_x_rap_param(api, data)
-            response = requests.post(self.base_url + api, headers=headers, data=data.encode('utf-8'), cookies=cookies, proxies=proxies, timeout=REQUEST_TIMEOUT)
+            response = _post(
+                self.base_url + api,
+                headers=headers,
+                data=data.encode('utf-8'),
+                cookies=cookies,
+                proxies=proxies,
+            )
             res_json = response.json()
             success, msg = res_json["success"], res_json["msg"]
         except Exception as e:
@@ -1091,6 +1131,3 @@ if __name__ == '__main__':
     note_url = r'https://www.xiaohongshu.com/explore/67d7c713000000000900e391?xsec_token=AB1ACxbo5cevHxV_bWibTmK8R1DDz0NnAW1PbFZLABXtE=&xsec_source=pc_user'
     success, msg, note_all_comment = xhs_apis.get_note_all_comment(note_url, cookies_str)
     logger.info(f'获取笔记评论结果 {json.dumps(note_all_comment, ensure_ascii=False)}: {success}, msg: {msg}')
-
-
-
