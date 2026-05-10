@@ -67,16 +67,28 @@ GET /api/app/accounts/{account_id}/summary
 
 ```json
 {
-  "account": {
+ "account": {
     "id": "primary_account_id",
     "name": "品牌主号",
     "nickname": "品牌号",
+    "user_uid": "xhs_user_uid",
     "status": "active",
     "cookie_preview": "abcd1234...efgh5678",
-    "failure_count": 0
+    "failure_count": 0,
+    "avatar": "https://img.example.com/avatar.jpg",
+    "following_count": 15,
+    "follower_count": 230,
+    "liked_count": 980,
+    "published_notes": []
   }
 }
 ```
+
+说明：
+
+- 主账号身份和登录态仍以主账号自身 Cookie 为准。
+- 公开资料和已发布笔记列表优先复用 `worker_search` 小号 Cookie 拉取，减少主账号请求量。
+- 小号不可用时回退到已有账号快照或主账号自身资料。
 
 ### 2.3.2 手机号验证码登录接口现状
 
@@ -161,6 +173,11 @@ POST /api/app/search-preview
 ```
 
 说明：该接口直接使用当前主账号 Cookie 执行一次搜索，立即返回帖子列表，不依赖先创建任务。
+
+错误码补充：
+
+- `401`：账号登录已失效，App 需要清空当前登录态并重新走手机号验证码登录
+- `502`：上游搜索接口暂时不可用，但账号登录态仍未判定失效
 
 ### 2.4 新增小号 Cookie
 
@@ -325,25 +342,26 @@ GET /api/app/publish-tasks/next?device_id=android-001&app_instance_id=app-instan
 }
 ```
 
-### 3.7 App 回传发帖结果
+错误码补充：
+
+- `401`：账号登录已失效，App 需要退出当前登录并重新登录
+- `502`：详情上游接口请求失败，但当前账号未被判定为失效
+
+### 3.7 App 执行发帖任务
 
 ```http
-POST /api/app/publish-tasks/{task_id}/result
+POST /api/app/publish-tasks/{task_id}/execute
 Content-Type: application/json
 ```
 
 ```json
 {
   "device_id": "android-001",
-  "app_instance_id": "app-instance-001",
-  "result_id": "publish-result-001",
-  "status": "published",
-  "post_id": "xhs_post_id",
-  "post_url": "https://www.xiaohongshu.com/explore/xxx",
-  "error_message": "",
-  "duration_seconds": 95
+  "app_instance_id": "app-instance-001"
 }
 ```
+
+说明：App 领取任务后，直接调用该接口。后台会下载任务里的媒体 URL，调用内部创作者发布接口执行发帖，并自动把成功/失败结果写回任务状态。
 
 ## 4. 关键词采集任务
 
@@ -482,23 +500,31 @@ Content-Type: application/json
       "title": "帖子标题",
       "author_name": "作者A",
       "author_id": "user_a",
+      "author_avatar": "https://cdn.example.com/avatar.jpg",
       "content_preview": "正文摘要",
       "content": "帖子完整正文",
       "note_type": "video",
       "topics": ["新加坡", "酒店"],
+      "cover_url": "https://cdn.example.com/cover.jpg",
       "image_urls": ["https://cdn.example.com/1.jpg"],
       "video_url": "https://cdn.example.com/1.mp4",
       "video_cover_url": "https://cdn.example.com/cover.jpg",
+      "location": "新加坡",
       "like_count": 12,
       "comment_count": 3,
       "collect_count": 1,
-      "publish_time": "2026-05-08T10:00:00+08:00"
+      "publish_time": "2026-05-08T10:00:00+08:00",
+      "worker_cookie_id": "worker_cookie_id"
     }
   ]
 }
 ```
 
-说明：当搜索结果没有单独标题时，后端会用正文前 30 个字符补标题，避免 App 列表出现空标题。
+说明：
+
+- App 仅用主账号维持登录态，实际搜索请求默认从小号池里选择 `worker_search` 小号 Cookie 执行。
+- 返回里的 `worker_cookie_id` 用于帖子详情继续复用同一搜索小号。
+- 当搜索结果没有单独标题时，后端会用正文前 30 个字符补标题，避免 App 列表出现空标题。
 
 ### 4.2.3 App 查看单条帖子详情
 
@@ -510,7 +536,8 @@ Content-Type: application/json
 ```json
 {
   "account_id": "primary_account_id",
-  "post_url": "https://www.xiaohongshu.com/explore/xxx"
+  "post_url": "https://www.xiaohongshu.com/explore/xxx",
+  "worker_cookie_id": "worker_cookie_id"
 }
 ```
 

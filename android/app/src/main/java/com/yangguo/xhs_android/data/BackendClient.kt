@@ -10,6 +10,8 @@ import java.net.URLEncoder
 import java.net.URL
 
 class BackendClient(private val config: AppConfig) {
+    class SessionExpiredException(message: String) : IllegalStateException(message)
+
     private fun jsonArrayToStringList(array: JSONArray?): List<String> {
         if (array == null) return emptyList()
         return List(array.length()) { index -> array.optString(index) }.filter { it.isNotBlank() }
@@ -21,6 +23,7 @@ class BackendClient(private val config: AppConfig) {
             postUrl = item.optString("post_url"),
             title = item.optString("title"),
             authorName = item.optString("author_name"),
+            authorAvatar = item.optString("author_avatar"),
             likeCount = item.optInt("like_count"),
             commentCount = item.optInt("comment_count"),
             collectCount = item.optInt("collect_count"),
@@ -32,8 +35,72 @@ class BackendClient(private val config: AppConfig) {
             imageUrls = jsonArrayToStringList(item.optJSONArray("image_urls")),
             videoUrl = item.optString("video_url"),
             videoCoverUrl = item.optString("video_cover_url"),
-            publishTime = item.optString("publish_time")
+            publishTime = item.optString("publish_time"),
+            location = item.optString("location"),
+            workerCookieId = item.optString("worker_cookie_id")
         )
+    }
+
+    internal fun normalizePublishTaskTitle(item: SearchResultItem): String {
+        val candidates = listOf(
+            item.title,
+            item.contentPreview,
+            item.content,
+        )
+        return candidates
+            .map { it.trim() }
+            .firstOrNull { it.isNotBlank() && it != "无标题" }
+            ?.take(120)
+            ?: "笔记${item.postId.takeLast(8).ifBlank { "" }}"
+    }
+
+    internal fun buildPublishTaskMediaUrls(item: SearchResultItem): List<String> {
+        if (item.videoUrl.isNotBlank()) {
+            return listOf(item.videoUrl.trim())
+        }
+        return item.imageUrls
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .ifEmpty {
+                listOf(item.coverUrl.trim()).filter { it.isNotBlank() }
+            }
+    }
+
+    internal fun resolvePublishTaskCoverUrl(item: SearchResultItem): String {
+        return item.coverUrl
+            .ifBlank { item.videoCoverUrl }
+            .ifBlank { item.imageUrls.firstOrNull().orEmpty() }
+            .trim()
+    }
+
+    internal fun buildPublishTaskDraft(item: SearchResultItem): PublishTaskDraft {
+        val mediaUrls = buildPublishTaskMediaUrls(item)
+        require(mediaUrls.isNotEmpty()) { "当前帖子没有可用的图片或视频" }
+        return PublishTaskDraft(
+            accountId = config.accountId,
+            title = normalizePublishTaskTitle(item),
+            desc = item.content.ifBlank { item.contentPreview }.trim(),
+            topics = item.topics.filter { it.isNotBlank() },
+            location = item.location.trim(),
+            mediaType = if (item.videoUrl.isNotBlank()) "video" else "image",
+            mediaUrls = mediaUrls,
+            coverUrl = resolvePublishTaskCoverUrl(item),
+        )
+    }
+
+    internal fun buildPublishTaskRequestBody(item: SearchResultItem): JSONObject {
+        val draft = buildPublishTaskDraft(item)
+        return JSONObject()
+            .put("account_id", draft.accountId)
+            .put("title", draft.title)
+            .put("desc", draft.desc)
+            .put("topics", JSONArray(draft.topics))
+            .put("location", draft.location)
+            .put("media_type", draft.mediaType)
+            .put("media_urls", JSONArray(draft.mediaUrls))
+            .put("cover_url", draft.coverUrl)
+            .put("review_status", draft.reviewStatus)
+            .put("max_retry", draft.maxRetry)
     }
 
     fun requestSmsCode(phone: String): SmsCodeSession {
@@ -58,17 +125,9 @@ class BackendClient(private val config: AppConfig) {
             .put("code", code.trim())
             .put("zone", "86")
             .put("account_id", config.accountId)
+            .put("device_id", config.deviceId)
         val response = JSONObject(request("POST", "/api/app/auth/login-with-sms", body))
-        val account = response.getJSONObject("account_summary")
-        return AccountSummary(
-            accountId = account.optString("id"),
-            name = account.optString("name"),
-            nickname = account.optString("nickname"),
-            status = account.optString("status"),
-            cookiePreview = account.optString("cookie_preview"),
-            failureCount = account.optInt("failure_count"),
-            remark = account.optString("remark")
-        ) to response.optString("cookies")
+        return parseAccountSummary(response.getJSONObject("account_summary")) to response.optString("cookies")
     }
 
     fun syncPrimaryCookie(cookie: String): String {
@@ -99,6 +158,7 @@ class BackendClient(private val config: AppConfig) {
     }
 
     private fun parseAccountSummary(account: JSONObject): AccountSummary {
+        val publishedNotes = account.optJSONArray("published_notes") ?: JSONArray()
         return AccountSummary(
             accountId = account.optString("id"),
             name = account.optString("name"),
@@ -106,7 +166,14 @@ class BackendClient(private val config: AppConfig) {
             status = account.optString("status"),
             cookiePreview = account.optString("cookie_preview"),
             failureCount = account.optInt("failure_count"),
-            remark = account.optString("remark")
+            remark = account.optString("remark"),
+            avatar = account.optString("avatar"),
+            followingCount = account.optInt("following_count"),
+            followerCount = account.optInt("follower_count"),
+            likedCount = account.optInt("liked_count"),
+            publishedNotes = List(publishedNotes.length()) { index ->
+                parseSearchResultItem(publishedNotes.getJSONObject(index))
+            }
         )
     }
 
@@ -125,6 +192,14 @@ class BackendClient(private val config: AppConfig) {
         val response = JSONObject(request("POST", "/api/app/search-tasks", body))
         val task = response.getJSONObject("task")
         return "关键词任务已创建：${task.optString("keyword")}"
+    }
+
+    fun createPublishTaskFromPost(item: SearchResultItem): String {
+        require(config.accountId.isNotBlank()) { "请先完成登录" }
+        val body = buildPublishTaskRequestBody(item)
+        val response = JSONObject(request("POST", "/api/publish-tasks", body))
+        val task = response.getJSONObject("task")
+        return task.optString("id")
     }
 
     fun searchPreview(keyword: String, requireNum: Int): SearchTaskDetail {
@@ -153,6 +228,17 @@ class BackendClient(private val config: AppConfig) {
         val body = JSONObject()
             .put("account_id", config.accountId)
             .put("post_url", postUrl.trim())
+        val response = JSONObject(request("POST", "/api/app/search-post-detail", body))
+        return parseSearchResultItem(response.getJSONObject("detail"))
+    }
+
+    fun fetchSearchPostDetail(item: SearchResultItem): SearchResultItem {
+        require(config.accountId.isNotBlank()) { "请先完成登录" }
+        require(item.postUrl.isNotBlank()) { "帖子链接为空" }
+        val body = JSONObject()
+            .put("account_id", config.accountId)
+            .put("post_url", item.postUrl.trim())
+            .put("worker_cookie_id", item.workerCookieId)
         val response = JSONObject(request("POST", "/api/app/search-post-detail", body))
         return parseSearchResultItem(response.getJSONObject("detail"))
     }
@@ -208,77 +294,60 @@ class BackendClient(private val config: AppConfig) {
         return AppTask(taskType = taskType, taskId = taskId, title = title, rawJson = task.toString(2))
     }
 
-    fun reportMockResult(task: AppTask): String {
-        val body = when (task.taskType) {
-            "publish" -> publishResult(task)
-            "search" -> searchResult(task)
-            "analytics" -> analyticsResult(task)
-            else -> error("未知任务类型：${task.taskType}")
-        }
-        request("POST", "/api/app/tasks/${task.taskType}/${task.taskId}/result", body)
-        return "任务结果已回传：${task.taskType}/${task.taskId}"
+    fun fetchNextPublishTask(): AppTask? {
+        val query = mapOf(
+            "device_id" to config.deviceId,
+            "app_instance_id" to config.appInstanceId,
+            "app_version" to config.appVersion,
+            "device_name" to config.deviceName
+        ).toQueryString()
+        val response = JSONObject(request("GET", "/api/app/publish-tasks/next?$query"))
+        if (response.isNull("task")) return null
+        val task = response.getJSONObject("task")
+        val taskId = task.optString("id")
+        return AppTask(
+            taskType = "publish",
+            taskId = taskId,
+            title = task.optString("title", taskId),
+            rawJson = task.toString(2)
+        )
     }
 
-    fun reportPublishResult(
-        task: AppTask,
-        status: String,
-        postId: String,
-        postUrl: String,
-        errorMessage: String,
-    ): String {
+    fun executePublishTask(task: AppTask): String {
         require(task.taskType == "publish") { "当前任务不是发帖任务" }
-        val body = baseResult(status)
-            .put("post_id", postId.trim())
-            .put("post_url", postUrl.trim())
-            .put("error_message", errorMessage.trim())
-        request("POST", "/api/app/tasks/${task.taskType}/${task.taskId}/result", body)
-        return "发帖结果已回传：${task.taskId}"
-    }
-
-    private fun publishResult(task: AppTask): JSONObject {
-        return baseResult("published")
-            .put("post_id", "mock-${task.taskId}")
-            .put("post_url", "https://www.xiaohongshu.com/explore/mock-${task.taskId}")
-    }
-
-    private fun searchResult(task: AppTask): JSONObject {
-        return baseResult("success")
-            .put("worker_cookie_id", JSONObject(task.rawJson).optString("worker_cookie_id"))
-            .put("partial_success", false)
-            .put("items", org.json.JSONArray())
-    }
-
-    private fun analyticsResult(task: AppTask): JSONObject {
-        val accountId = JSONObject(task.rawJson).optString("account_id", config.accountId)
-        val snapshot = JSONObject()
-            .put("account_id", accountId)
-            .put("nickname", "")
-            .put("follower_count", 0)
-            .put("liked_count", 0)
-            .put("post_count", 0)
-            .put("collected_total", 0)
-            .put("posts", org.json.JSONArray())
-        return baseResult("success")
-            .put("worker_cookie_id", JSONObject(task.rawJson).optString("worker_cookie_id"))
-            .put("snapshot", snapshot)
-    }
-
-    private fun baseResult(status: String): JSONObject {
-        return JSONObject()
+        val body = JSONObject()
             .put("device_id", config.deviceId)
             .put("app_instance_id", config.appInstanceId)
-            .put("result_id", "${System.currentTimeMillis()}-${config.appInstanceId.take(8)}")
-            .put("status", status)
-            .put("error_message", "")
-            .put("duration_seconds", 0)
+        val response = JSONObject(
+            request(
+                method = "POST",
+                path = "/api/app/publish-tasks/${task.taskId}/execute",
+                body = body,
+                readTimeoutMillis = 180000,
+            )
+        )
+        val taskJson = response.getJSONObject("task")
+        val taskStatus = taskJson.optString("task_status")
+        val postId = taskJson.optString("published_post_id")
+        return if (taskStatus == "success") {
+            if (postId.isBlank()) "发帖成功：${task.taskId}" else "发帖成功：$postId"
+        } else {
+            throw IllegalStateException(taskJson.optString("last_error").ifBlank { "发布失败" })
+        }
     }
 
-    private fun request(method: String, path: String, body: JSONObject? = null): String {
+    private fun request(
+        method: String,
+        path: String,
+        body: JSONObject? = null,
+        connectTimeoutMillis: Int = 8000,
+        readTimeoutMillis: Int = 12000,
+    ): String {
         val url = URL("${config.baseUrl.trimEnd('/')}$path")
         val connection = (url.openConnection() as HttpURLConnection).apply {
             requestMethod = method
-            connectTimeout = 8000
-            readTimeout = 12000
+            connectTimeout = connectTimeoutMillis
+            readTimeout = readTimeoutMillis
             setRequestProperty("Content-Type", "application/json")
             setRequestProperty("Accept", "application/json")
             if (body != null) {
@@ -298,9 +367,22 @@ class BackendClient(private val config: AppConfig) {
         }
         connection.disconnect()
         if (responseCode !in 200..299) {
-            throw IllegalStateException("HTTP $responseCode: $response")
+            val detail = runCatching {
+                JSONObject(response).optString("detail").ifBlank { response }
+            }.getOrElse { response }
+            if (responseCode == 401 || isSessionExpiredMessage(detail)) {
+                throw SessionExpiredException(detail.ifBlank { "登录已失效，请重新登录" })
+            }
+            throw IllegalStateException("HTTP $responseCode: ${detail.ifBlank { response }}")
         }
         return response
+    }
+
+    private fun isSessionExpiredMessage(message: String): Boolean {
+        val lowered = message.lowercase()
+        return "登录已失效" in message ||
+            "重新登录" in message ||
+            "cookie" in lowered && ("失效" in message || "invalid" in lowered || "expired" in lowered)
     }
 
     private fun Map<String, String>.toQueryString(): String {

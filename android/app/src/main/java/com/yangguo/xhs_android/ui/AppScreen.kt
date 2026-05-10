@@ -15,7 +15,6 @@ import com.yangguo.xhs_android.data.AppConfigStore
 import com.yangguo.xhs_android.data.AppStatus
 import com.yangguo.xhs_android.data.AppTask
 import com.yangguo.xhs_android.data.BackendClient
-import com.yangguo.xhs_android.data.PublishReportDraft
 import com.yangguo.xhs_android.data.SearchResultItem
 import kotlin.concurrent.thread
 
@@ -29,12 +28,30 @@ fun AppScreen(configStore: AppConfigStore) {
     var code by remember { mutableStateOf("") }
     var keyword by remember { mutableStateOf("") }
     var requireNumText by remember { mutableStateOf("20") }
-    var publishDraft by remember { mutableStateOf(PublishReportDraft()) }
     var status by remember { mutableStateOf(AppStatus(message = context.getString(R.string.status_idle))) }
     var currentTab by remember { mutableStateOf(HomeTab.PUBLISH) }
     var selectedSearchItem by remember { mutableStateOf<SearchResultItem?>(null) }
+    var selectedPublishTask by remember { mutableStateOf<AppTask?>(null) }
+    var isProfileSettingsOpen by remember { mutableStateOf(false) }
 
     fun text(@StringRes id: Int, vararg args: Any): String = context.getString(id, *args)
+
+    fun handleSessionExpired(message: String) {
+        config = configStore.clearLoginState()
+        selectedSearchItem = null
+        selectedPublishTask = null
+        isProfileSettingsOpen = false
+        status = status.copy(
+            message = if (message.isBlank()) text(R.string.status_login_expired) else message,
+            latestTask = null,
+            accountSummary = null,
+            smsCodeSession = null,
+            searchTasks = emptyList(),
+            searchTaskDetail = null,
+            requiresRelogin = true,
+            isLoading = false
+        )
+    }
 
     fun ensureLoginReady(): Boolean {
         if (config.accountId.isBlank()) {
@@ -50,11 +67,17 @@ fun AppScreen(configStore: AppConfigStore) {
 
     fun runAction(successMessage: String? = null, block: () -> Unit) {
         status = status.copy(isLoading = true)
+        selectedPublishTask = null
         thread {
             val result = runCatching(block)
             mainHandler.post {
+                val error = result.exceptionOrNull()
+                if (error is BackendClient.SessionExpiredException) {
+                    handleSessionExpired(error.message.orEmpty())
+                    return@post
+                }
                 status = status.copy(
-                    message = result.exceptionOrNull()?.message ?: successMessage ?: context.getString(R.string.status_idle),
+                    message = error?.message ?: successMessage ?: context.getString(R.string.status_idle),
                     isLoading = false
                 )
             }
@@ -67,12 +90,14 @@ fun AppScreen(configStore: AppConfigStore) {
         thread {
             val result = runCatching(block)
             mainHandler.post {
-                val task = result.getOrNull()
-                if (task != null && task.taskType == "publish") {
-                    publishDraft = publishDraft.copy(status = "published", postId = "", postUrl = "", errorMessage = "")
+                val error = result.exceptionOrNull()
+                if (error is BackendClient.SessionExpiredException) {
+                    handleSessionExpired(error.message.orEmpty())
+                    return@post
                 }
+                val task = result.getOrNull()
                 status = status.copy(
-                    message = result.exceptionOrNull()?.message ?: if (task == null) text(R.string.status_no_task) else text(R.string.status_task_claimed, task.taskType),
+                    message = error?.message ?: if (task == null) text(R.string.status_no_task) else text(R.string.status_task_claimed, task.taskType),
                     latestTask = task,
                     isLoading = false
                 )
@@ -84,11 +109,18 @@ fun AppScreen(configStore: AppConfigStore) {
         if (!ensureLoginReady()) return
         status = status.copy(isLoading = true)
         selectedSearchItem = null
+        selectedPublishTask = null
+        isProfileSettingsOpen = false
         thread {
             val result = runCatching { BackendClient(config).listSearchTasks() }
             mainHandler.post {
+                val error = result.exceptionOrNull()
+                if (error is BackendClient.SessionExpiredException) {
+                    handleSessionExpired(error.message.orEmpty())
+                    return@post
+                }
                 status = status.copy(
-                    message = result.exceptionOrNull()?.message ?: text(R.string.status_loading_search_task),
+                    message = error?.message ?: text(R.string.status_loading_search_task),
                     searchTasks = result.getOrDefault(emptyList()),
                     isLoading = false
                 )
@@ -100,11 +132,18 @@ fun AppScreen(configStore: AppConfigStore) {
         if (!ensureLoginReady()) return
         status = status.copy(isLoading = true)
         selectedSearchItem = null
+        selectedPublishTask = null
+        isProfileSettingsOpen = false
         thread {
             val result = runCatching { BackendClient(config).fetchSearchTaskDetail(taskId) }
             mainHandler.post {
+                val error = result.exceptionOrNull()
+                if (error is BackendClient.SessionExpiredException) {
+                    handleSessionExpired(error.message.orEmpty())
+                    return@post
+                }
                 status = status.copy(
-                    message = result.exceptionOrNull()?.message ?: text(R.string.status_loading_task_detail),
+                    message = error?.message ?: text(R.string.status_loading_task_detail),
                     searchTaskDetail = result.getOrNull(),
                     isLoading = false
                 )
@@ -124,8 +163,13 @@ fun AppScreen(configStore: AppConfigStore) {
                 )
             }
             mainHandler.post {
+                val error = result.exceptionOrNull()
+                if (error is BackendClient.SessionExpiredException) {
+                    handleSessionExpired(error.message.orEmpty())
+                    return@post
+                }
                 status = status.copy(
-                    message = result.exceptionOrNull()?.message ?: text(R.string.status_search_result),
+                    message = error?.message ?: text(R.string.status_search_result),
                     searchTaskDetail = result.getOrNull(),
                     isLoading = false
                 )
@@ -136,14 +180,40 @@ fun AppScreen(configStore: AppConfigStore) {
     fun runSearchPostDetailAction(item: SearchResultItem) {
         if (!ensureLoginReady()) return
         status = status.copy(isLoading = true)
+        isProfileSettingsOpen = false
+        selectedPublishTask = null
         thread {
             val result = runCatching {
-                if (item.postUrl.isBlank()) item else BackendClient(config).fetchSearchPostDetail(item.postUrl)
+                if (item.postUrl.isBlank()) item else BackendClient(config).fetchSearchPostDetail(item)
             }
             mainHandler.post {
+                val error = result.exceptionOrNull()
+                if (error is BackendClient.SessionExpiredException) {
+                    handleSessionExpired(error.message.orEmpty())
+                    return@post
+                }
                 selectedSearchItem = result.getOrNull()
                 status = status.copy(
-                    message = result.exceptionOrNull()?.message ?: text(R.string.status_loading_post_detail),
+                    message = error?.message ?: text(R.string.status_loading_post_detail),
+                    isLoading = false
+                )
+            }
+        }
+    }
+
+    fun runCreatePublishTaskFromPostAction(item: SearchResultItem) {
+        if (!ensureLoginReady()) return
+        status = status.copy(isLoading = true)
+        thread {
+            val result = runCatching { BackendClient(config).createPublishTaskFromPost(item) }
+            mainHandler.post {
+                val error = result.exceptionOrNull()
+                if (error is BackendClient.SessionExpiredException) {
+                    handleSessionExpired(error.message.orEmpty())
+                    return@post
+                }
+                status = status.copy(
+                    message = error?.message ?: text(R.string.status_publish_task_created, result.getOrNull().orEmpty()),
                     isLoading = false
                 )
             }
@@ -156,8 +226,13 @@ fun AppScreen(configStore: AppConfigStore) {
         thread {
             val result = runCatching { BackendClient(config).fetchAccountSummary() }
             mainHandler.post {
+                val error = result.exceptionOrNull()
+                if (error is BackendClient.SessionExpiredException) {
+                    handleSessionExpired(error.message.orEmpty())
+                    return@post
+                }
                 status = status.copy(
-                    message = result.exceptionOrNull()?.message ?: text(R.string.status_loading_account),
+                    message = error?.message ?: text(R.string.status_loading_account),
                     accountSummary = result.getOrNull(),
                     isLoading = false
                 )
@@ -177,17 +252,44 @@ fun AppScreen(configStore: AppConfigStore) {
                     val invalid = !check.success || check.account.status == "invalid"
                     if (invalid) {
                         config = configStore.clearLoginState()
+                        selectedPublishTask = null
+                        selectedSearchItem = null
+                    }
+                    if (invalid) {
+                        status = status.copy(
+                            message = text(R.string.status_login_expired),
+                            accountSummary = check.account,
+                            requiresRelogin = true,
+                            smsCodeSession = null,
+                            isLoading = false
+                        )
+                    } else {
+                        thread {
+                            val summaryResult = runCatching { BackendClient(config).fetchAccountSummary() }
+                            mainHandler.post {
+                                val summaryError = summaryResult.exceptionOrNull()
+                                if (summaryError is BackendClient.SessionExpiredException) {
+                                    handleSessionExpired(summaryError.message.orEmpty())
+                                    return@post
+                                }
+                                status = status.copy(
+                                    message = summaryError?.message ?: text(R.string.status_loading_account),
+                                    accountSummary = summaryResult.getOrNull() ?: check.account,
+                                    requiresRelogin = false,
+                                    smsCodeSession = status.smsCodeSession,
+                                    isLoading = false
+                                )
+                            }
+                        }
+                    }
+                } else {
+                    val error = result.exceptionOrNull()
+                    if (error is BackendClient.SessionExpiredException) {
+                        handleSessionExpired(error.message.orEmpty())
+                        return@post
                     }
                     status = status.copy(
-                        message = if (invalid) text(R.string.status_login_expired) else text(R.string.status_account_valid),
-                        accountSummary = check.account,
-                        requiresRelogin = invalid,
-                        smsCodeSession = if (invalid) null else status.smsCodeSession,
-                        isLoading = false
-                    )
-                } else {
-                    status = status.copy(
-                        message = result.exceptionOrNull()?.message ?: text(R.string.section_status),
+                        message = error?.message ?: text(R.string.section_status),
                         isLoading = false
                     )
                 }
@@ -200,9 +302,14 @@ fun AppScreen(configStore: AppConfigStore) {
         thread {
             val result = runCatching { BackendClient(config).requestSmsCode(phone) }
             mainHandler.post {
+                val error = result.exceptionOrNull()
+                if (error is BackendClient.SessionExpiredException) {
+                    handleSessionExpired(error.message.orEmpty())
+                    return@post
+                }
                 val session = result.getOrNull()
                 status = status.copy(
-                    message = result.exceptionOrNull()?.message ?: text(R.string.status_code_sent),
+                    message = error?.message ?: text(R.string.status_code_sent),
                     smsCodeSession = session,
                     isLoading = false
                 )
@@ -219,11 +326,16 @@ fun AppScreen(configStore: AppConfigStore) {
             }
             val listResult = if (result.isSuccess) runCatching { BackendClient(config).listSearchTasks() } else null
             mainHandler.post {
+                val error = result.exceptionOrNull()
+                if (error is BackendClient.SessionExpiredException) {
+                    handleSessionExpired(error.message.orEmpty())
+                    return@post
+                }
                 if (result.isSuccess) {
                     keyword = ""
                 }
                 status = status.copy(
-                    message = result.exceptionOrNull()?.message ?: result.getOrNull() ?: text(R.string.section_search_form),
+                    message = error?.message ?: result.getOrNull() ?: text(R.string.section_search_form),
                     searchTasks = listResult?.getOrDefault(status.searchTasks) ?: status.searchTasks,
                     isLoading = false
                 )
@@ -242,11 +354,18 @@ fun AppScreen(configStore: AppConfigStore) {
                 )
             }
             mainHandler.post {
+                val error = result.exceptionOrNull()
+                if (error is BackendClient.SessionExpiredException) {
+                    handleSessionExpired(error.message.orEmpty())
+                    return@post
+                }
                 val loginResult = result.getOrNull()
                 if (loginResult != null) {
                     val (summary, cookies) = loginResult
                     config = configStore.saveLoginState(summary.accountId, cookies)
                     currentTab = HomeTab.PUBLISH
+                    isProfileSettingsOpen = false
+                    selectedPublishTask = null
                     status = status.copy(
                         message = text(R.string.status_login_success),
                         accountSummary = summary,
@@ -256,7 +375,7 @@ fun AppScreen(configStore: AppConfigStore) {
                     )
                 } else {
                     status = status.copy(
-                        message = result.exceptionOrNull()?.message ?: text(R.string.page_login),
+                        message = error?.message ?: text(R.string.page_login),
                         isLoading = false
                     )
                 }
@@ -266,20 +385,52 @@ fun AppScreen(configStore: AppConfigStore) {
 
     fun runPublishResultAction() {
         val task = status.latestTask ?: return
-        runAction(successMessage = text(R.string.status_publish_reported, task.taskId)) {
-            BackendClient(config).reportPublishResult(
-                task = task,
-                status = publishDraft.status,
-                postId = publishDraft.postId,
-                postUrl = publishDraft.postUrl,
-                errorMessage = publishDraft.errorMessage
-            )
+        status = status.copy(isLoading = true)
+        thread {
+            val result = runCatching {
+                BackendClient(config).executePublishTask(task)
+            }
+            mainHandler.post {
+                val error = result.exceptionOrNull()
+                if (error is BackendClient.SessionExpiredException) {
+                    handleSessionExpired(error.message.orEmpty())
+                    return@post
+                }
+                if (result.isSuccess) {
+                    status = status.copy(
+                        message = result.getOrNull() ?: text(R.string.status_publish_reported, task.taskId),
+                        latestTask = null,
+                        isLoading = false
+                    )
+                    selectedPublishTask = null
+                } else {
+                    status = status.copy(
+                        message = error?.message ?: text(R.string.status_idle),
+                        isLoading = false
+                    )
+                }
+            }
         }
     }
 
     LaunchedEffect(config.accountId) {
         if (config.accountId.isNotBlank() && status.accountSummary == null) {
             runAccountCheckAction(silent = true)
+        }
+    }
+
+    LaunchedEffect(currentTab, config.accountId) {
+        val summary = status.accountSummary
+        if (
+            currentTab == HomeTab.PROFILE &&
+            config.accountId.isNotBlank() &&
+            !status.requiresRelogin &&
+            !status.isLoading &&
+            summary != null &&
+            summary.avatar.isBlank() &&
+            summary.publishedNotes.isEmpty()
+        ) {
+            runAccountSummaryAction()
         }
     }
 
@@ -306,11 +457,22 @@ fun AppScreen(configStore: AppConfigStore) {
         return
     }
 
-    if (currentTab == HomeTab.SEARCH && selectedSearchItem != null) {
+    if (selectedSearchItem != null) {
         SearchDetailScreen(
             item = selectedSearchItem!!,
             status = status,
-            onBack = { selectedSearchItem = null }
+            onBack = { selectedSearchItem = null },
+            onCreatePublishTask = { runCreatePublishTaskFromPostAction(selectedSearchItem!!) }
+        )
+        return
+    }
+
+    if (currentTab == HomeTab.PUBLISH && selectedPublishTask != null) {
+        PublishTaskDetailScreen(
+            task = selectedPublishTask!!,
+            status = status,
+            onBack = { selectedPublishTask = null },
+            onReportResult = { runPublishResultAction() }
         )
         return
     }
@@ -318,22 +480,25 @@ fun AppScreen(configStore: AppConfigStore) {
     HomeScreen(
         currentTab = currentTab,
         status = status,
-        onTabChange = { currentTab = it }
+        onTabChange = {
+            currentTab = it
+            if (it != HomeTab.PROFILE) {
+                isProfileSettingsOpen = false
+            }
+            if (it != HomeTab.SEARCH) {
+                selectedSearchItem = null
+            }
+            if (it != HomeTab.PUBLISH) {
+                selectedPublishTask = null
+            }
+        }
     ) {
         when (currentTab) {
             HomeTab.PUBLISH -> PublishModule(
                 latestTask = status.latestTask,
-                draft = publishDraft,
-                onFetchTask = { runTaskAction { BackendClient(config).fetchNextTask() } },
-                onDraftChange = { publishDraft = it },
+                onFetchTask = { runTaskAction { BackendClient(config).fetchNextPublishTask() } },
                 onReportResult = { runPublishResultAction() },
-                onReportMockResult = {
-                    status.latestTask?.let { task ->
-                        runAction(successMessage = text(R.string.status_task_reported, task.taskType, task.taskId)) {
-                            BackendClient(config).reportMockResult(task)
-                        }
-                    }
-                },
+                onOpenTask = { selectedPublishTask = it },
             )
             HomeTab.SEARCH -> SearchModule(
                 keyword = keyword,
@@ -351,7 +516,9 @@ fun AppScreen(configStore: AppConfigStore) {
             HomeTab.PROFILE -> ProfileModule(
                 config = config,
                 accountSummary = status.accountSummary,
+                currentLanguageCode = config.languageCode,
                 requiresRelogin = status.requiresRelogin,
+                isSettingsOpen = isProfileSettingsOpen,
                 baseUrl = baseUrl,
                 onBaseUrlChange = { baseUrl = it },
                 onSaveBaseUrl = {
@@ -371,11 +538,16 @@ fun AppScreen(configStore: AppConfigStore) {
                         searchTaskDetail = null
                     )
                     selectedSearchItem = null
+                    selectedPublishTask = null
+                    isProfileSettingsOpen = false
                 },
                 onLanguageChange = { languageCode ->
                     config = configStore.saveLanguage(languageCode)
                     status = status.copy(message = text(R.string.status_config_saved))
-                }
+                },
+                onOpenPublishedItem = { runSearchPostDetailAction(it) },
+                onOpenSettings = { isProfileSettingsOpen = true },
+                onCloseSettings = { isProfileSettingsOpen = false }
             )
         }
     }

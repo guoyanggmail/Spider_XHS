@@ -20,6 +20,7 @@ class Account(Base):
     account_type: Mapped[str] = mapped_column(String(20), nullable=False)
     name: Mapped[str] = mapped_column(String(100), nullable=False)
     nickname: Mapped[str] = mapped_column(String(100), default="", nullable=False)
+    user_uid: Mapped[str] = mapped_column(String(100), default="", nullable=False)
     cookies: Mapped[str] = mapped_column(Text, nullable=False)
     cookie_preview: Mapped[str] = mapped_column(String(64), default="", nullable=False)
     status: Mapped[str] = mapped_column(String(20), default="active", nullable=False)

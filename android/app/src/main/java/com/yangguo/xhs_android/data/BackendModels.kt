@@ -18,11 +18,31 @@ data class AppTask(
     val rawJson: String
 )
 
-data class PublishReportDraft(
-    val status: String = "published",
-    val postId: String = "",
-    val postUrl: String = "",
-    val errorMessage: String = "",
+data class PublishTaskDetail(
+    val taskId: String,
+    val title: String,
+    val content: String,
+    val topics: List<String>,
+    val location: String,
+    val mediaType: String,
+    val mediaUrls: List<String>,
+    val coverUrl: String,
+    val taskStatus: String,
+    val lastError: String,
+    val publishedPostUrl: String
+)
+
+data class PublishTaskDraft(
+    val accountId: String,
+    val title: String,
+    val desc: String,
+    val topics: List<String>,
+    val location: String,
+    val mediaType: String,
+    val mediaUrls: List<String>,
+    val coverUrl: String,
+    val reviewStatus: String = "pending",
+    val maxRetry: Int = 1
 )
 
 data class SearchTaskSummary(
@@ -39,6 +59,7 @@ data class SearchResultItem(
     val postUrl: String,
     val title: String,
     val authorName: String,
+    val authorAvatar: String,
     val likeCount: Int,
     val commentCount: Int,
     val collectCount: Int,
@@ -50,7 +71,9 @@ data class SearchResultItem(
     val imageUrls: List<String>,
     val videoUrl: String,
     val videoCoverUrl: String,
-    val publishTime: String
+    val publishTime: String,
+    val location: String,
+    val workerCookieId: String
 )
 
 data class SearchTaskDetail(
@@ -67,7 +90,12 @@ data class AccountSummary(
     val status: String,
     val cookiePreview: String,
     val failureCount: Int,
-    val remark: String
+    val remark: String,
+    val avatar: String,
+    val followingCount: Int,
+    val followerCount: Int,
+    val likedCount: Int,
+    val publishedNotes: List<SearchResultItem>
 )
 
 data class AccountCheckResult(

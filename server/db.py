@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Generator
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
@@ -99,11 +99,23 @@ def init_db(drop_existing: bool = False, retries: int = 10, retry_delay: float =
             if drop_existing:
                 Base.metadata.drop_all(bind=engine)
             Base.metadata.create_all(bind=engine)
+            ensure_runtime_schema(engine)
             return
         except OperationalError:
             if attempt >= retries:
                 raise
             time.sleep(retry_delay)
+
+
+def ensure_runtime_schema(engine) -> None:
+    inspector = inspect(engine)
+    if "accounts" not in inspector.get_table_names():
+        return
+    columns = {column["name"] for column in inspector.get_columns("accounts")}
+    if "user_uid" not in columns:
+        ddl = "ALTER TABLE accounts ADD COLUMN user_uid VARCHAR(100) NOT NULL DEFAULT ''"
+        with engine.begin() as connection:
+            connection.execute(text(ddl))
 
 
 configure_database()

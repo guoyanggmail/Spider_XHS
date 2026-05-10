@@ -123,6 +123,7 @@
 | `account_type` | `varchar(20)` | `primary` / `worker` |
 | `name` | `varchar(100)` | 账号名称 |
 | `nickname` | `varchar(100)` | 最近识别昵称 |
+| `user_uid` | `varchar(100)` | 小红书账号 UID，用于主账号去重复用 |
 | `cookies` | `text` | 原始 Cookie |
 | `cookie_preview` | `varchar(64)` | 脱敏预览 |
 | `status` | `varchar(20)` | `active/cooldown/invalid/disabled` |

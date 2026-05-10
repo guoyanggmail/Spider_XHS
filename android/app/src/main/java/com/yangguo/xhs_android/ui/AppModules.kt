@@ -3,6 +3,8 @@ package com.yangguo.xhs_android.ui
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Box
@@ -13,14 +15,19 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -32,20 +39,21 @@ import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
-import androidx.compose.material3.RadioButton
-import androidx.compose.material3.RadioButtonDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.unit.dp
@@ -58,10 +66,12 @@ import com.yangguo.xhs_android.data.AccountSummary
 import com.yangguo.xhs_android.data.AppConfig
 import com.yangguo.xhs_android.data.AppStatus
 import com.yangguo.xhs_android.data.AppTask
-import com.yangguo.xhs_android.data.PublishReportDraft
+import com.yangguo.xhs_android.data.PublishTaskDetail
 import com.yangguo.xhs_android.data.SearchTaskDetail
 import com.yangguo.xhs_android.data.SearchResultItem
 import com.yangguo.xhs_android.data.SearchTaskSummary
+import org.json.JSONArray
+import org.json.JSONObject
 import com.yangguo.xhs_android.ui.theme.BorderSoft
 import com.yangguo.xhs_android.ui.theme.BrandRed
 import com.yangguo.xhs_android.ui.theme.TextSecondary
@@ -343,132 +353,287 @@ fun SearchModule(
                 style = MaterialTheme.typography.bodyMedium,
                 color = TextSecondary
             )
+        }
+        Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
             taskDetail.results.forEach { item ->
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(containerColor = WarmSurfaceAlt),
-                    shape = RoundedCornerShape(20.dp)
-                ) {
-                    Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text(item.title.ifBlank { item.postId }, style = MaterialTheme.typography.titleMedium)
-                        Text(
-                            stringResource(R.string.author_name, item.authorName.ifBlank { stringResource(R.string.empty_author) }),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = TextSecondary
-                        )
-                        Text(
-                            stringResource(R.string.engagement_summary, item.likeCount, item.commentCount, item.collectCount),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = TextSecondary
-                        )
-                        if (item.contentPreview.isNotBlank()) {
-                            Text(item.contentPreview, style = MaterialTheme.typography.bodyMedium)
-                        }
-                        SecondaryButton(
-                            text = stringResource(R.string.view_post_detail),
-                            onClick = { onOpenItem(item) }
-                        )
-                    }
-                }
+                SearchPostCard(item = item, onClick = { onOpenItem(item) })
             }
         }
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SearchDetailScreen(
     item: SearchResultItem,
     status: AppStatus,
     onBack: () -> Unit,
+    onCreatePublishTask: (() -> Unit)? = null,
 ) {
-    Scaffold(
-        containerColor = WarmBackground,
-        topBar = {
-            TopAppBar(
-                title = { Text(stringResource(R.string.section_post_detail)) },
-                navigationIcon = {
-                    SecondaryButton(
-                        text = stringResource(R.string.back_to_results),
-                        onClick = onBack,
-                        modifier = Modifier.padding(start = 12.dp)
-                    )
-                }
-            )
-        }
-    ) { innerPadding ->
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(WarmBackground)
+    ) {
+        SearchDetailTopBar(
+            item = item,
+            onBack = onBack,
+            onCreatePublishTask = onCreatePublishTask,
+            modifier = Modifier.statusBarsPadding()
+        )
         Column(
             modifier = Modifier
-                .fillMaxSize()
-                .padding(innerPadding)
-                .background(WarmBackground)
+                .weight(1f)
                 .verticalScroll(rememberScrollState())
-                .padding(20.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            AppCard {
-                Text(item.title.ifBlank { item.postId }, style = MaterialTheme.typography.headlineSmall)
-                Text(
-                    stringResource(R.string.author_name, item.authorName.ifBlank { stringResource(R.string.empty_author) }),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = TextSecondary
-                )
-                if (item.noteType.isNotBlank()) {
-                    Text(stringResource(R.string.note_type_value, item.noteType), style = MaterialTheme.typography.bodySmall, color = TextSecondary)
-                }
-                if (item.publishTime.isNotBlank()) {
-                    Text(stringResource(R.string.publish_time_value, item.publishTime), style = MaterialTheme.typography.bodySmall, color = TextSecondary)
-                }
-                Text(
-                    stringResource(R.string.engagement_summary, item.likeCount, item.commentCount, item.collectCount),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = TextSecondary
-                )
-                if (item.content.isNotBlank()) {
-                    Text(stringResource(R.string.post_content_label), style = MaterialTheme.typography.labelLarge)
-                    Text(item.content, style = MaterialTheme.typography.bodyLarge)
+            PostMediaGallery(item = item)
+            Column(
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 18.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                val displayTitle = displayPostTitle(item.title)
+                if (displayTitle.isNotBlank()) {
+                    Text(displayTitle, style = MaterialTheme.typography.titleLarge)
                 }
                 if (item.topics.isNotEmpty()) {
-                    Text(stringResource(R.string.post_topics_label), style = MaterialTheme.typography.labelLarge)
-                    Text(item.topics.joinToString(" ") { "#$it" }, style = MaterialTheme.typography.bodyMedium, color = BrandRed)
+                    Text(item.topics.joinToString(" ") { "#$it" }, style = MaterialTheme.typography.bodyLarge, color = BrandRed)
+                }
+                if (item.content.isNotBlank()) {
+                    Text(item.content, style = MaterialTheme.typography.bodyLarge)
+                }
+                val metaParts = listOf(item.publishTime, item.location).filter { it.isNotBlank() }
+                if (metaParts.isNotEmpty()) {
+                    Text(metaParts.joinToString(" "), style = MaterialTheme.typography.bodySmall, color = TextSecondary)
                 }
             }
-            if (item.imageUrls.isNotEmpty()) {
-                AppCard {
-                    Text(stringResource(R.string.post_images_label), style = MaterialTheme.typography.titleMedium)
-                    item.imageUrls.forEach { imageUrl ->
-                        AsyncImage(
-                            model = imageUrl,
-                            contentDescription = null,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(240.dp),
-                            contentScale = ContentScale.Crop
-                        )
-                    }
+        }
+        PostDetailActionBar(item = item)
+        StatusPanel(status = status)
+    }
+}
+
+@Composable
+private fun SearchPostCard(item: SearchResultItem, onClick: () -> Unit) {
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(22.dp))
+            .clickable(onClick = onClick),
+        color = WarmSurface,
+        shadowElevation = 2.dp
+    ) {
+        Column {
+            AsyncImage(
+                model = displayCoverUrl(item),
+                contentDescription = null,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .aspectRatio(1f),
+                contentScale = ContentScale.Crop
+            )
+            Column(
+                modifier = Modifier.padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                val displayTitle = displayPostTitle(item.title)
+                if (displayTitle.isNotBlank()) {
+                    Text(
+                        displayTitle,
+                        style = MaterialTheme.typography.titleMedium,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    PostAuthorInfo(
+                        avatarUrl = item.authorAvatar,
+                        authorName = item.authorName.ifBlank { stringResource(R.string.empty_author) },
+                    )
+                    Text(
+                        stringResource(R.string.search_card_metrics, item.likeCount, item.commentCount),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = TextSecondary
+                    )
                 }
             }
-            if (item.videoUrl.isNotBlank()) {
-                AppCard {
-                    Text(stringResource(R.string.post_video_label), style = MaterialTheme.typography.titleMedium)
-                    VideoPlayer(url = item.videoUrl)
-                    if (item.videoCoverUrl.isNotBlank()) {
-                        Text(stringResource(R.string.video_cover_value, item.videoCoverUrl), style = MaterialTheme.typography.bodySmall, color = TextSecondary)
-                    }
-                }
-            }
-            if (item.postUrl.isNotBlank()) {
-                AppCard {
-                    Text(stringResource(R.string.post_url_value, item.postUrl), style = MaterialTheme.typography.bodySmall, color = TextSecondary)
-                }
-            }
-            StatusPanel(status = status)
         }
     }
 }
 
 @Composable
-private fun VideoPlayer(url: String) {
+private fun PostAuthorInfo(avatarUrl: String, authorName: String, modifier: Modifier = Modifier) {
+    Row(modifier = modifier, verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        AvatarImage(avatarUrl = avatarUrl, authorName = authorName)
+        Text(authorName, style = MaterialTheme.typography.bodyMedium, color = TextSecondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+    }
+}
+
+@Composable
+private fun AvatarImage(avatarUrl: String, authorName: String, modifier: Modifier = Modifier) {
+    if (avatarUrl.isNotBlank()) {
+        AsyncImage(
+            model = avatarUrl,
+            contentDescription = null,
+            modifier = modifier
+                .size(30.dp)
+                .clip(CircleShape),
+            contentScale = ContentScale.Crop
+        )
+    } else {
+        Box(
+            modifier = modifier
+                .size(30.dp)
+                .background(BrandRed.copy(alpha = 0.12f), CircleShape),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(authorName.take(1).ifBlank { "?" }, color = BrandRed, style = MaterialTheme.typography.labelMedium)
+        }
+    }
+}
+
+@Composable
+private fun SearchDetailTopBar(
+    item: SearchResultItem,
+    onBack: () -> Unit,
+    onCreatePublishTask: (() -> Unit)? = null,
+    modifier: Modifier = Modifier
+) {
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .background(WarmSurface)
+            .padding(horizontal = 16.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Surface(
+                modifier = Modifier.size(36.dp).clickable(onClick = onBack),
+                shape = CircleShape,
+                color = WarmSurfaceAlt
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Text("‹", style = MaterialTheme.typography.titleLarge, color = TextSecondary)
+                }
+            }
+            PostAuthorInfo(
+                avatarUrl = item.authorAvatar,
+                authorName = item.authorName.ifBlank { stringResource(R.string.empty_author) }
+            )
+        }
+        if (onCreatePublishTask != null) {
+            Surface(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(16.dp))
+                    .clickable(onClick = onCreatePublishTask),
+                shape = RoundedCornerShape(16.dp),
+                color = WarmSurfaceAlt
+            ) {
+                Text(
+                    stringResource(R.string.create_publish_task),
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                    style = MaterialTheme.typography.labelLarge,
+                    color = BrandRed
+                )
+            }
+        } else {
+            Spacer(modifier = Modifier.width(36.dp))
+        }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun PostMediaGallery(item: SearchResultItem) {
+    val mediaItems = item.imageUrls.filter { it.isNotBlank() }
+    when {
+        item.videoUrl.isNotBlank() -> {
+            Box(modifier = Modifier.fillMaxWidth().aspectRatio(1f).background(WarmSurface)) {
+                VideoPlayer(url = item.videoUrl, modifier = Modifier.fillMaxSize())
+            }
+        }
+        mediaItems.isNotEmpty() -> {
+            val pagerState = rememberPagerState(pageCount = { mediaItems.size })
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                HorizontalPager(
+                    state = pagerState,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .aspectRatio(1f)
+                ) { page ->
+                    AsyncImage(
+                        model = mediaItems[page],
+                        contentDescription = null,
+                        modifier = Modifier.fillMaxSize(),
+                        contentScale = ContentScale.Crop
+                    )
+                }
+                if (mediaItems.size > 1) {
+                    Row(
+                        modifier = Modifier.padding(top = 12.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        repeat(mediaItems.size) { index ->
+                            Box(
+                                modifier = Modifier
+                                    .size(if (index == pagerState.currentPage) 8.dp else 6.dp)
+                                    .background(
+                                        if (index == pagerState.currentPage) BrandRed else BorderSoft,
+                                        CircleShape
+                                    )
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        displayCoverUrl(item).isNotBlank() -> {
+            AsyncImage(
+                model = displayCoverUrl(item),
+                contentDescription = null,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .aspectRatio(1f),
+                contentScale = ContentScale.Crop
+            )
+        }
+    }
+}
+
+@Composable
+private fun PostDetailActionBar(item: SearchResultItem) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(WarmSurface)
+            .padding(horizontal = 16.dp, vertical = 14.dp),
+        horizontalArrangement = Arrangement.End
+    ) {
+        Text(
+            stringResource(R.string.post_detail_metrics, item.likeCount, item.collectCount, item.commentCount),
+            style = MaterialTheme.typography.bodyMedium,
+            color = TextSecondary
+        )
+    }
+}
+
+private fun displayPostTitle(title: String): String {
+    return title.takeIf { it.isNotBlank() && it != "无标题" } ?: ""
+}
+
+private fun displayCoverUrl(item: SearchResultItem): String {
+    return item.coverUrl.ifBlank {
+        item.videoCoverUrl.ifBlank {
+            item.imageUrls.firstOrNull().orEmpty()
+        }
+    }
+}
+
+@Composable
+private fun VideoPlayer(url: String, modifier: Modifier = Modifier) {
     val context = LocalContext.current
     val player = remember(url) {
         ExoPlayer.Builder(context).build().apply {
@@ -486,91 +651,208 @@ private fun VideoPlayer(url: String) {
                 useController = true
             }
         },
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(240.dp)
+        modifier = modifier
     )
 }
 
 @Composable
 fun PublishModule(
     latestTask: AppTask?,
-    draft: PublishReportDraft,
     onFetchTask: () -> Unit,
-    onDraftChange: (PublishReportDraft) -> Unit,
     onReportResult: () -> Unit,
-    onReportMockResult: () -> Unit,
+    onOpenTask: (AppTask) -> Unit,
 ) {
     Text(stringResource(R.string.publish_page_title), style = MaterialTheme.typography.headlineSmall)
     AppCard {
         Text(stringResource(R.string.section_publish_task), style = MaterialTheme.typography.titleMedium)
         Text(stringResource(R.string.publish_intro), style = MaterialTheme.typography.bodyMedium, color = TextSecondary)
-        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
-            PrimaryButton(
-                text = stringResource(R.string.fetch_task),
-                onClick = onFetchTask,
-                modifier = Modifier.weight(1f)
-            )
-            SecondaryButton(
-                text = stringResource(R.string.report_result),
-                onClick = onReportResult,
-                enabled = latestTask != null,
-                modifier = Modifier.weight(1f)
-            )
-        }
-        SecondaryButton(
-            text = stringResource(R.string.report_mock),
-            onClick = onReportMockResult,
-            enabled = latestTask != null
+        PrimaryButton(
+            text = stringResource(if (latestTask == null) R.string.fetch_task else R.string.task_in_progress),
+            onClick = onFetchTask,
+            enabled = latestTask == null
         )
         latestTask?.let { task ->
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = WarmSurfaceAlt),
-                shape = RoundedCornerShape(20.dp)
-            ) {
-                Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text(stringResource(R.string.task_type, task.taskType), style = MaterialTheme.typography.bodySmall, color = TextSecondary)
-                    Text(stringResource(R.string.task_title, task.title), style = MaterialTheme.typography.titleMedium)
-                    Text(stringResource(R.string.task_id, task.taskId), style = MaterialTheme.typography.bodySmall, color = TextSecondary)
-                }
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(18.dp), modifier = Modifier.fillMaxWidth()) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    RadioButton(
-                        selected = draft.status == "published",
-                        onClick = { onDraftChange(draft.copy(status = "published")) },
-                        colors = RadioButtonDefaults.colors(selectedColor = BrandRed)
-                    )
-                    Text(stringResource(R.string.success_label))
-                }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    RadioButton(
-                        selected = draft.status == "failed",
-                        onClick = { onDraftChange(draft.copy(status = "failed")) },
-                        colors = RadioButtonDefaults.colors(selectedColor = BrandRed)
-                    )
-                    Text(stringResource(R.string.failed_label))
-                }
-            }
-            AppTextField(draft.postId, { onDraftChange(draft.copy(postId = it)) }, R.string.post_id_label)
-            AppTextField(draft.postUrl, { onDraftChange(draft.copy(postUrl = it)) }, R.string.post_url_label)
-            AppTextField(
-                value = draft.errorMessage,
-                onValueChange = { onDraftChange(draft.copy(errorMessage = it)) },
-                labelRes = R.string.error_reason_label,
-                singleLine = false,
-                minLines = 3
+            PublishTaskCard(task = task, onClick = { onOpenTask(task) })
+            Text(
+                stringResource(R.string.publish_task_hint),
+                style = MaterialTheme.typography.bodySmall,
+                color = TextSecondary
+            )
+            PrimaryButton(
+                text = stringResource(R.string.start_publish),
+                onClick = onReportResult,
             )
         }
     }
 }
 
 @Composable
+fun PublishTaskDetailScreen(
+    task: AppTask,
+    status: AppStatus,
+    onBack: () -> Unit,
+    onReportResult: () -> Unit,
+) {
+    val detail = remember(task.rawJson) { parsePublishTaskDetail(task) }
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(WarmBackground)
+    ) {
+        SearchDetailTopBar(
+            item = SearchResultItem(
+                postId = detail.taskId,
+                postUrl = detail.publishedPostUrl,
+                title = detail.title,
+                authorName = "",
+                authorAvatar = "",
+                likeCount = 0,
+                commentCount = 0,
+                collectCount = 0,
+                contentPreview = detail.content,
+                content = detail.content,
+                noteType = detail.mediaType,
+                topics = detail.topics,
+                coverUrl = detail.coverUrl,
+                imageUrls = if (detail.mediaType == "image") detail.mediaUrls else emptyList(),
+                videoUrl = if (detail.mediaType == "video") detail.mediaUrls.firstOrNull().orEmpty() else "",
+                videoCoverUrl = detail.coverUrl,
+                publishTime = "",
+                location = detail.location,
+                workerCookieId = ""
+            ),
+            onBack = onBack,
+            modifier = Modifier.statusBarsPadding()
+        )
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .verticalScroll(rememberScrollState())
+        ) {
+            PublishTaskMediaGallery(detail)
+            Column(
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 18.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                Text(detail.title, style = MaterialTheme.typography.titleLarge)
+                if (detail.topics.isNotEmpty()) {
+                    Text(detail.topics.joinToString(" ") { "#$it" }, style = MaterialTheme.typography.bodyLarge, color = BrandRed)
+                }
+                if (detail.content.isNotBlank()) {
+                    Text(detail.content, style = MaterialTheme.typography.bodyLarge)
+                }
+                val metaParts = listOf(detail.location, detail.taskStatus).filter { it.isNotBlank() }
+                if (metaParts.isNotEmpty()) {
+                    Text(metaParts.joinToString(" "), style = MaterialTheme.typography.bodySmall, color = TextSecondary)
+                }
+                if (detail.lastError.isNotBlank()) {
+                    Text(detail.lastError, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                }
+            }
+        }
+        PrimaryButton(
+            text = stringResource(R.string.start_publish),
+            onClick = onReportResult,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 12.dp)
+        )
+        StatusPanel(status = status)
+    }
+}
+
+@Composable
+private fun PublishTaskCard(task: AppTask, onClick: () -> Unit) {
+    val detail = remember(task.rawJson) { parsePublishTaskDetail(task) }
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(22.dp))
+            .clickable(onClick = onClick),
+        color = WarmSurfaceAlt,
+        shadowElevation = 1.dp
+    ) {
+        Column {
+            val cover = detail.coverUrl.ifBlank { detail.mediaUrls.firstOrNull().orEmpty() }
+            if (cover.isNotBlank()) {
+                AsyncImage(
+                    model = cover,
+                    contentDescription = null,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .aspectRatio(1f),
+                    contentScale = ContentScale.Crop
+                )
+            }
+            Column(
+                modifier = Modifier.padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text(detail.title.ifBlank { task.title }, style = MaterialTheme.typography.titleMedium, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                if (detail.content.isNotBlank()) {
+                    Text(detail.content, style = MaterialTheme.typography.bodyMedium, maxLines = 2, overflow = TextOverflow.Ellipsis, color = TextSecondary)
+                }
+                Text(stringResource(R.string.task_id, task.taskId), style = MaterialTheme.typography.bodySmall, color = TextSecondary)
+            }
+        }
+    }
+}
+
+@Composable
+private fun PublishTaskMediaGallery(detail: PublishTaskDetail) {
+    val item = SearchResultItem(
+        postId = detail.taskId,
+        postUrl = detail.publishedPostUrl,
+        title = detail.title,
+        authorName = "",
+        authorAvatar = "",
+        likeCount = 0,
+        commentCount = 0,
+        collectCount = 0,
+        contentPreview = detail.content,
+        content = detail.content,
+        noteType = detail.mediaType,
+        topics = detail.topics,
+        coverUrl = detail.coverUrl,
+        imageUrls = if (detail.mediaType == "image") detail.mediaUrls else emptyList(),
+        videoUrl = if (detail.mediaType == "video") detail.mediaUrls.firstOrNull().orEmpty() else "",
+        videoCoverUrl = detail.coverUrl,
+        publishTime = "",
+        location = detail.location,
+        workerCookieId = ""
+    )
+    PostMediaGallery(item)
+}
+
+private fun parsePublishTaskDetail(task: AppTask): PublishTaskDetail {
+    val json = runCatching { JSONObject(task.rawJson) }.getOrDefault(JSONObject())
+    return PublishTaskDetail(
+        taskId = json.optString("id", task.taskId),
+        title = json.optString("title", task.title),
+        content = json.optString("desc"),
+        topics = jsonArrayToStringList(json.optJSONArray("topics")),
+        location = json.optString("location"),
+        mediaType = json.optString("media_type"),
+        mediaUrls = jsonArrayToStringList(json.optJSONArray("media_urls")),
+        coverUrl = json.optString("cover_url"),
+        taskStatus = json.optString("task_status"),
+        lastError = json.optString("last_error"),
+        publishedPostUrl = json.optString("published_post_url")
+    )
+}
+
+private fun jsonArrayToStringList(array: JSONArray?): List<String> {
+    if (array == null) return emptyList()
+    return List(array.length()) { index -> array.optString(index) }.filter { it.isNotBlank() }
+}
+
+@Composable
 fun ProfileModule(
     config: AppConfig,
     accountSummary: AccountSummary?,
+    currentLanguageCode: String,
     requiresRelogin: Boolean,
+    isSettingsOpen: Boolean,
     baseUrl: String,
     onBaseUrlChange: (String) -> Unit,
     onSaveBaseUrl: () -> Unit,
@@ -578,51 +860,75 @@ fun ProfileModule(
     onCheckStatus: () -> Unit,
     onLogout: () -> Unit,
     onLanguageChange: (String) -> Unit,
+    onOpenPublishedItem: (SearchResultItem) -> Unit,
+    onOpenSettings: () -> Unit,
+    onCloseSettings: () -> Unit,
 ) {
-    Text(stringResource(R.string.profile_page_title), style = MaterialTheme.typography.headlineSmall)
-    AppCard {
-        Row(horizontalArrangement = Arrangement.spacedBy(14.dp), verticalAlignment = Alignment.CenterVertically) {
-            Box(
-                modifier = Modifier
-                    .size(52.dp)
-                    .background(BrandRed.copy(alpha = 0.14f), CircleShape),
-                contentAlignment = Alignment.Center
-            ) {
-                Text("ME", color = BrandRed, style = MaterialTheme.typography.labelLarge)
-            }
-            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+    if (isSettingsOpen) {
+        ProfileSettingsModule(
+            config = config,
+            currentLanguageCode = currentLanguageCode,
+            requiresRelogin = requiresRelogin,
+            baseUrl = baseUrl,
+            onBaseUrlChange = onBaseUrlChange,
+            onSaveBaseUrl = onSaveBaseUrl,
+            onLoadSummary = onLoadSummary,
+            onCheckStatus = onCheckStatus,
+            onLogout = onLogout,
+            onLanguageChange = onLanguageChange,
+            onBack = onCloseSettings,
+        )
+        return
+    }
+
+    val summary = accountSummary
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(stringResource(R.string.profile_page_title), style = MaterialTheme.typography.headlineSmall)
+        SecondaryButton(stringResource(R.string.open_settings), onOpenSettings)
+    }
+    Column(verticalArrangement = Arrangement.spacedBy(18.dp), modifier = Modifier.fillMaxWidth()) {
+        Row(horizontalArrangement = Arrangement.spacedBy(16.dp), verticalAlignment = Alignment.CenterVertically) {
+            AvatarImage(
+                avatarUrl = summary?.avatar.orEmpty(),
+                authorName = summary?.nickname?.ifBlank { summary?.name.orEmpty() }.orEmpty(),
+                modifier = Modifier.size(84.dp)
+            )
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.weight(1f)) {
                 Text(
-                    accountSummary?.nickname?.ifBlank { accountSummary.name } ?: stringResource(R.string.profile_page_title),
-                    style = MaterialTheme.typography.titleLarge
+                    summary?.nickname?.ifBlank { summary.name } ?: stringResource(R.string.profile_page_title),
+                    style = MaterialTheme.typography.headlineSmall
                 )
-                Text(stringResource(R.string.current_account_id, config.accountId), style = MaterialTheme.typography.bodySmall, color = TextSecondary)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    ProfileInfoChip(text = stringResource(R.string.account_id_chip, config.accountId.takeLast(8)))
+                    ProfileInfoChip(text = stringResource(R.string.account_status_chip, summary?.status ?: ""))
+                }
+                if (requiresRelogin) {
+                    Text(
+                        stringResource(R.string.relogin_hint),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error
+                    )
+                }
             }
         }
-        if (requiresRelogin) {
-            Text(stringResource(R.string.relogin_hint), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
-        }
+        summary?.let { ProfileStatsStrip(it) }
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
-            SecondaryButton(stringResource(R.string.view_detail), onLoadSummary, modifier = Modifier.weight(1f))
-            SecondaryButton(stringResource(R.string.check_status), onCheckStatus, modifier = Modifier.weight(1f))
+            SecondaryButton(stringResource(R.string.refresh_and_check), onCheckStatus, modifier = Modifier.weight(1f))
         }
-        PrimaryButton(stringResource(R.string.logout_action), onLogout)
-        accountSummary?.let { summary ->
-            AccountSummaryCard(summary)
+        ProfileNoteTabHeader()
+        if (summary == null || summary.publishedNotes.isEmpty()) {
+            EmptyProfileNotes()
+        } else {
+            Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                summary.publishedNotes.forEach { item ->
+                    SearchPostCard(item = item, onClick = { onOpenPublishedItem(item) })
+                }
+            }
         }
-    }
-    AppCard {
-        Text(stringResource(R.string.section_language), style = MaterialTheme.typography.titleMedium)
-        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
-            SecondaryButton(stringResource(R.string.language_zh), { onLanguageChange("zh") }, modifier = Modifier.weight(1f))
-            SecondaryButton(stringResource(R.string.language_en), { onLanguageChange("en") }, modifier = Modifier.weight(1f))
-        }
-    }
-    AppCard {
-        Text(stringResource(R.string.section_connection), style = MaterialTheme.typography.titleMedium)
-        AppTextField(baseUrl, onBaseUrlChange, R.string.backend_url_label)
-        Text(stringResource(R.string.device_id_value, config.deviceId), style = MaterialTheme.typography.bodySmall, color = TextSecondary)
-        Text(stringResource(R.string.app_instance_id_value, config.appInstanceId), style = MaterialTheme.typography.bodySmall, color = TextSecondary)
-        SecondaryButton(stringResource(R.string.save_settings), onSaveBaseUrl)
     }
 }
 
@@ -642,6 +948,179 @@ private fun AccountSummaryCard(summary: AccountSummary) {
                 Text(stringResource(R.string.account_remark, summary.remark), style = MaterialTheme.typography.bodySmall, color = TextSecondary)
             }
         }
+    }
+}
+
+@Composable
+private fun ProfileSettingsModule(
+    config: AppConfig,
+    currentLanguageCode: String,
+    requiresRelogin: Boolean,
+    baseUrl: String,
+    onBaseUrlChange: (String) -> Unit,
+    onSaveBaseUrl: () -> Unit,
+    onLoadSummary: () -> Unit,
+    onCheckStatus: () -> Unit,
+    onLogout: () -> Unit,
+    onLanguageChange: (String) -> Unit,
+    onBack: () -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        SecondaryButton(stringResource(R.string.back_action), onBack)
+        Text(stringResource(R.string.section_settings), style = MaterialTheme.typography.titleLarge)
+        Spacer(modifier = Modifier.width(84.dp))
+    }
+    AppCard {
+        Text(stringResource(R.string.settings_account_title), style = MaterialTheme.typography.titleMedium)
+        SecondaryButton(stringResource(R.string.refresh_and_check), onCheckStatus, modifier = Modifier.fillMaxWidth())
+        if (requiresRelogin) {
+            Text(stringResource(R.string.relogin_hint), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+        }
+        PrimaryButton(stringResource(R.string.logout_action), onLogout)
+    }
+    AppCard {
+        Text(stringResource(R.string.settings_language_title), style = MaterialTheme.typography.titleMedium)
+        LanguageOptionGroup(currentLanguageCode = currentLanguageCode, onLanguageChange = onLanguageChange)
+    }
+    AppCard {
+        Text(stringResource(R.string.settings_connection_title), style = MaterialTheme.typography.titleMedium)
+        AppTextField(baseUrl, onBaseUrlChange, R.string.backend_url_label)
+        SecondaryButton(stringResource(R.string.save_settings), onSaveBaseUrl)
+    }
+    AppCard {
+        Text(stringResource(R.string.settings_device_title), style = MaterialTheme.typography.titleMedium)
+        Text(stringResource(R.string.device_id_value, config.deviceId), style = MaterialTheme.typography.bodySmall, color = TextSecondary)
+        Text(stringResource(R.string.app_instance_id_value, config.appInstanceId), style = MaterialTheme.typography.bodySmall, color = TextSecondary)
+    }
+}
+
+@Composable
+private fun LanguageOptionGroup(currentLanguageCode: String, onLanguageChange: (String) -> Unit) {
+    Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+        LanguageOptionButton(
+            text = stringResource(R.string.language_system_option),
+            selected = currentLanguageCode.isBlank(),
+            onClick = { onLanguageChange("") },
+            modifier = Modifier.weight(1f)
+        )
+        LanguageOptionButton(
+            text = stringResource(R.string.language_zh),
+            selected = currentLanguageCode == "zh",
+            onClick = { onLanguageChange("zh") },
+            modifier = Modifier.weight(1f)
+        )
+        LanguageOptionButton(
+            text = stringResource(R.string.language_en),
+            selected = currentLanguageCode == "en",
+            onClick = { onLanguageChange("en") },
+            modifier = Modifier.weight(1f)
+        )
+    }
+}
+
+@Composable
+private fun LanguageOptionButton(
+    text: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Button(
+        onClick = onClick,
+        modifier = modifier,
+        shape = RoundedCornerShape(16.dp),
+        colors = ButtonDefaults.buttonColors(
+            containerColor = if (selected) BrandRed.copy(alpha = 0.12f) else WarmSurfaceAlt,
+            contentColor = if (selected) BrandRed else MaterialTheme.colorScheme.onSurface
+        )
+    ) {
+        Text(text)
+    }
+}
+
+@Composable
+private fun ProfileStatsStrip(summary: AccountSummary) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(24.dp)
+    ) {
+        ProfileStatItem(value = summary.followingCount, labelRes = R.string.profile_stat_following)
+        ProfileStatItem(value = summary.followerCount, labelRes = R.string.profile_stat_followers)
+        ProfileStatItem(value = summary.likedCount, labelRes = R.string.profile_stat_likes)
+    }
+}
+
+@Composable
+private fun ProfileStatItem(value: Int, labelRes: Int) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text(value.toString(), style = MaterialTheme.typography.titleLarge)
+        Text(stringResource(labelRes), style = MaterialTheme.typography.bodySmall, color = TextSecondary)
+    }
+}
+
+@Composable
+private fun ProfileInfoChip(text: String) {
+    Surface(
+        color = WarmSurface,
+        shape = RoundedCornerShape(999.dp),
+        tonalElevation = 1.dp,
+        shadowElevation = 1.dp
+    ) {
+        Text(
+            text = text,
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+            style = MaterialTheme.typography.bodySmall,
+            color = TextSecondary
+        )
+    }
+}
+
+@Composable
+private fun ProfileNoteTabHeader() {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.Center
+    ) {
+        Surface(
+            color = WarmSurface,
+            shape = RoundedCornerShape(999.dp),
+            tonalElevation = 1.dp
+        ) {
+            Text(
+                text = stringResource(R.string.profile_notes_tab),
+                modifier = Modifier.padding(horizontal = 28.dp, vertical = 12.dp),
+                style = MaterialTheme.typography.titleMedium
+            )
+        }
+    }
+}
+
+@Composable
+private fun EmptyProfileNotes() {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 44.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Box(
+            modifier = Modifier
+                .size(88.dp)
+                .border(1.dp, BorderSoft, CircleShape),
+            contentAlignment = Alignment.Center
+        ) {
+            Text("○", style = MaterialTheme.typography.headlineMedium, color = BorderSoft)
+        }
+        Text(
+            stringResource(R.string.profile_notes_empty),
+            style = MaterialTheme.typography.bodyMedium,
+            color = TextSecondary
+        )
     }
 }
 
