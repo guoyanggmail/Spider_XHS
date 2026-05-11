@@ -9,7 +9,7 @@ from sqlalchemy import select
 
 from server import main
 from server.db import configure_database, get_session_factory, init_db, utc_now
-from server.models import Account, PublishTask, SearchTask, TaskResult
+from server.models import Account, PublishTask, SearchResult, SearchTask, TaskResult
 
 
 @pytest.fixture()
@@ -69,12 +69,32 @@ def test_primary_and_worker_accounts_are_listed(client: TestClient):
     assert "..." in body["primary_accounts"][0]["cookie_preview"]
 
 
-def test_cookie_check_updates_status(client: TestClient):
+def test_cookie_check_updates_status(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    class FakeContentApi:
+        def get_user_self_info2(self, cookies_str: str, proxies=None):
+            return True, "成功", {"success": True, "data": {"nickname": "brand"}}
+
+    monkeypatch.setattr(main, "get_pc_content_api", lambda: FakeContentApi())
     account_id = create_primary_account(client)
     response = client.post(f"/api/accounts/primary/{account_id}/check")
     assert response.status_code == 200
     assert response.json()["success"] is True
     assert response.json()["account"]["status"] == "active"
+
+
+def test_worker_check_uses_real_validation_and_sets_identity(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    class FakeContentApi:
+        def get_user_self_info2(self, cookies_str: str, proxies=None):
+            return True, "成功", {"success": True, "data": {"nickname": "worker-name", "user_id": "worker-uid"}}
+
+    monkeypatch.setattr(main, "get_pc_content_api", lambda: FakeContentApi())
+    worker_id = create_worker_cookie(client, "worker-1", ["worker_search"])
+    response = client.post(f"/api/cookie-workers/{worker_id}/check")
+    assert response.status_code == 200
+    body = response.json()["worker_cookie"]
+    assert response.json()["success"] is True
+    assert body["nickname"] == "worker-name"
+    assert body["user_uid"] == "worker-uid"
 
 
 def test_worker_status_update_keeps_existing_usage_tags(client: TestClient):
@@ -91,7 +111,34 @@ def test_worker_status_update_keeps_existing_usage_tags(client: TestClient):
     assert response.status_code == 200
     body = response.json()["worker_cookie"]
     assert body["status"] == "disabled"
-    assert body["usage_tags"] == ["worker_search"]
+    assert body["usage_tags"] == []
+
+
+def test_media_proxy_returns_remote_image(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    class FakeResponse:
+        headers = {"content-type": "image/jpeg"}
+        content = b"fake-image-bytes"
+
+        def raise_for_status(self):
+            return None
+
+    def fake_get(url: str, timeout: int, headers: dict[str, str]):
+        assert url == "https://cdn.example.com/image.jpg"
+        assert timeout == 30
+        assert "xiaohongshu.com" in headers["Referer"]
+        return FakeResponse()
+
+    monkeypatch.setattr(main.requests, "get", fake_get)
+
+    response = client.get("/api/media-proxy", params={"url": "https://cdn.example.com/image.jpg"})
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("image/jpeg")
+    assert response.content == b"fake-image-bytes"
+
+
+def test_media_proxy_rejects_non_http_url(client: TestClient):
+    response = client.get("/api/media-proxy", params={"url": "file:///tmp/test.jpg"})
+    assert response.status_code == 400
 
 
 def test_app_can_fetch_account_summary(client: TestClient):
@@ -1436,6 +1483,78 @@ def test_requeue_publish_task(client: TestClient):
     assert body["claim_expires_at"] is None
 
 
+def test_delete_search_task(client: TestClient):
+    create_worker_cookie(client, "worker-search", ["worker_search"])
+    response = client.post("/api/search-tasks", json={"keyword": "A", "group_name": "brand_a"})
+    task_id = response.json()["task"]["id"]
+
+    delete_response = client.delete(f"/api/search-tasks/{task_id}")
+    assert delete_response.status_code == 200
+    assert delete_response.json()["deleted"] is True
+
+    with get_session_factory()() as session:
+        assert session.get(SearchTask, task_id) is None
+
+
+def test_delete_analytics_task(client: TestClient):
+    account_id = create_primary_account(client)
+    response = client.post("/api/analytics-tasks", json={"account_id": account_id, "group_name": ""})
+    task_id = response.json()["task"]["id"]
+
+    delete_response = client.delete(f"/api/analytics-tasks/{task_id}")
+    assert delete_response.status_code == 200
+    assert delete_response.json()["deleted"] is True
+
+    with get_session_factory()() as session:
+        assert session.get(main.AnalyticsTask, task_id) is None
+
+
+def test_search_results_list_is_deduplicated_by_post_id(client: TestClient):
+    task_a = client.post("/api/search-tasks", json={"keyword": "A", "group_name": "brand_a"}).json()["task"]["id"]
+    task_b = client.post("/api/search-tasks", json={"keyword": "B", "group_name": "brand_a"}).json()["task"]["id"]
+
+    with get_session_factory()() as session:
+        session.add_all(
+            [
+                SearchResult(
+                    search_task_id=task_a,
+                    result_id="result-1",
+                    post_id="dup-post",
+                    post_url="https://example.com/1",
+                    title="旧标题",
+                    content_preview="旧内容",
+                    author_id="a1",
+                    author_name="作者A",
+                    like_count=1,
+                    comment_count=1,
+                    collect_count=1,
+                    raw_payload={"post_id": "dup-post", "title": "旧标题"},
+                ),
+                SearchResult(
+                    search_task_id=task_b,
+                    result_id="result-2",
+                    post_id="dup-post",
+                    post_url="https://example.com/2",
+                    title="新标题",
+                    content_preview="新内容",
+                    author_id="a2",
+                    author_name="作者B",
+                    like_count=2,
+                    comment_count=2,
+                    collect_count=2,
+                    raw_payload={"post_id": "dup-post", "title": "新标题"},
+                ),
+            ]
+        )
+        session.commit()
+
+    response = client.get("/api/search-results")
+    assert response.status_code == 200
+    results = response.json()["results"]
+    assert len(results) == 1
+    assert results[0]["title"] == "新标题"
+
+
 def test_claim_timeout_is_reclaimed(client: TestClient):
     create_worker_cookie(client, "worker-search", ["worker_search"])
     response = client.post("/api/search-tasks", json={"keyword": "A", "group_name": "brand_a"})
@@ -1666,6 +1785,347 @@ def test_analytics_snapshot_is_saved(client: TestClient):
     assert len(snapshots) == 1
     assert snapshots[0]["nickname"] == "品牌号"
     assert snapshots[0]["posts"][0]["post_id"] == "p-1"
+
+
+def test_backend_scheduler_executes_search_task(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    create_worker_cookie(client, "worker-search", ["worker_search"])
+    create_primary_account(client)
+    response = client.post(
+        "/api/search-tasks",
+        json={"keyword": "酒店", "group_name": "brand_a", "require_num": 2, "interval_minutes": 120},
+    )
+    assert response.status_code == 200
+
+    class FakeContentApi:
+        def search_some_note(self, keyword, require_num, cookies, sort_type_choice=0, note_type=0, note_time=0):
+            assert keyword == "酒店"
+            assert require_num == 2
+            return True, "成功", [
+                {
+                    "id": "note-1",
+                    "note_card": {
+                        "display_title": "酒店笔记",
+                        "desc": "正文摘要",
+                        "type": "normal",
+                        "user": {"nickname": "作者A", "user_id": "user-1"},
+                        "interact_info": {"liked_count": 10, "comment_count": 2, "collected_count": 3},
+                        "image_list": [{"info_list": [{"url": "https://img.example.com/1.jpg"}]}],
+                    },
+                }
+            ]
+
+    monkeypatch.setattr(main, "get_pc_content_api", lambda: FakeContentApi())
+    monkeypatch.setattr(main, "backend_task_request_pause", lambda: None)
+
+    with get_session_factory()() as session:
+        worker = session.execute(select(Account).where(Account.account_type == "worker")).scalar_one()
+        worker.last_check_at = utc_now().replace(tzinfo=None)
+        session.commit()
+
+    result = main.run_backend_task_cycle_once()
+    assert result["search"] is True
+
+    response = client.get("/api/search-results")
+    assert response.status_code == 200
+    results = response.json()["results"]
+    assert len(results) == 1
+    assert results[0]["title"] == "酒店笔记"
+
+
+def test_backend_scheduler_executes_analytics_task(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    account_id = create_primary_account(client)
+    create_worker_cookie(client, "worker-analytics", ["worker_analytics"])
+    response = client.post("/api/analytics-tasks", json={"account_id": account_id, "group_name": "brand_a"})
+    assert response.status_code == 200
+
+    with get_session_factory()() as session:
+        account = session.get(Account, account_id)
+        assert account is not None
+        account.user_uid = "uid-1"
+        session.commit()
+
+    class FakeContentApi:
+        def get_user_info(self, user_id: str, cookies_str: str, proxies=None):
+            assert user_id == "uid-1"
+            return True, "成功", {
+                "success": True,
+                "data": {
+                    "nickname": "主账号昵称",
+                    "fans_count": 230,
+                    "follow_count": 15,
+                    "interaction": 980,
+                },
+            }
+
+        def get_user_note_info(self, user_id: str, cursor: str, cookies_str: str, xsec_token="", xsec_source="", proxies=None):
+            return True, "成功", {
+                "success": True,
+                "data": {
+                    "notes": [
+                        {
+                            "id": "note-1",
+                            "note_card": {
+                                "display_title": "发布笔记A",
+                                "desc": "正文A",
+                                "type": "normal",
+                                "user": {"nickname": "主账号昵称", "user_id": "uid-1"},
+                                "interact_info": {"liked_count": 11, "comment_count": 2, "collected_count": 3},
+                                "image_list": [{"info_list": [{"url": "https://img.example.com/cover-a.jpg"}]}],
+                            },
+                        }
+                    ]
+                },
+            }
+
+        def get_user_self_info2(self, cookies_str: str, proxies=None):
+            return True, "成功", {"success": True, "data": {"avatar": "https://img.example.com/avatar.jpg"}}
+
+    class FakeCreatorApi:
+        def get_all_publish_note_info(self, cookies_str: str):
+            return False, "skip", []
+
+    monkeypatch.setattr(main, "get_pc_content_api", lambda: FakeContentApi())
+    monkeypatch.setattr(main, "get_creator_api", lambda: FakeCreatorApi())
+    monkeypatch.setattr(main, "backend_task_request_pause", lambda: None)
+
+    with get_session_factory()() as session:
+        worker = session.execute(select(Account).where(Account.account_type == "worker")).scalar_one()
+        worker.last_check_at = utc_now().replace(tzinfo=None)
+        session.commit()
+
+    result = main.run_backend_task_cycle_once()
+    assert result["analytics"] is True
+
+    response = client.get("/api/analytics-snapshots", params={"account_id": account_id})
+    assert response.status_code == 200
+    snapshots = response.json()["snapshots"]
+    assert len(snapshots) == 1
+    assert snapshots[0]["nickname"] == "主账号昵称"
+    assert snapshots[0]["posts"][0]["title"] == "发布笔记A"
+
+
+def test_complete_backend_analytics_task_serializes_datetime_payload(client: TestClient):
+    account_id = create_primary_account(client)
+    worker_id = create_worker_cookie(client, "worker-analytics", ["worker_analytics"])
+    response = client.post("/api/analytics-tasks", json={"account_id": account_id, "group_name": ""})
+    assert response.status_code == 200
+    task_id = response.json()["task"]["id"]
+
+    with get_session_factory()() as session:
+        task = session.get(main.AnalyticsTask, task_id)
+        worker = session.get(Account, worker_id)
+        assert task is not None
+        assert worker is not None
+        summary = {
+            "nickname": "主账号昵称",
+            "follower_count": 5,
+            "liked_count": 1,
+            "collected_total": None,
+            "checked_at": utc_now(),
+            "published_notes": [
+                {
+                    "post_id": "note-1",
+                    "title": "发布笔记A",
+                    "post_url": "https://www.xiaohongshu.com/explore/note-1",
+                    "like_count": 11,
+                    "comment_count": 2,
+                    "collect_count": 3,
+                    "publish_time": utc_now(),
+                }
+            ],
+        }
+
+        main.complete_backend_analytics_task(session, task, worker, summary)
+        session.commit()
+
+        snapshot = session.execute(select(main.AnalyticsSnapshot)).scalar_one()
+        assert isinstance(snapshot.raw_payload["checked_at"], str)
+        assert isinstance(snapshot.raw_payload["published_notes"][0]["publish_time"], str)
+
+
+def test_run_search_task_now_ignores_due_window(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    create_worker_cookie(client, "worker-search", ["worker_search"])
+    response = client.post(
+        "/api/search-tasks",
+        json={"keyword": "酒店", "group_name": "", "require_num": 1, "interval_minutes": 120},
+    )
+    assert response.status_code == 200
+    task_id = response.json()["task"]["id"]
+
+    with get_session_factory()() as session:
+        task = session.get(SearchTask, task_id)
+        worker = session.execute(select(Account).where(Account.account_type == "worker")).scalar_one()
+        assert task is not None
+        task.last_run_at = utc_now()
+        worker.last_check_at = utc_now().replace(tzinfo=None)
+        session.commit()
+
+    class FakeContentApi:
+        def search_some_note(self, keyword, require_num, cookies, sort_type_choice=0, note_type=0, note_time=0):
+            return True, "成功", [
+                {
+                    "id": "note-force-1",
+                    "note_card": {
+                        "display_title": "强制执行笔记",
+                        "desc": "正文",
+                        "type": "normal",
+                        "user": {"nickname": "作者A", "user_id": "user-1"},
+                        "interact_info": {"liked_count": 1, "comment_count": 2, "collected_count": 3},
+                        "image_list": [{"info_list": [{"url": "https://img.example.com/1.jpg"}]}],
+                    },
+                }
+            ]
+
+    monkeypatch.setattr(main, "get_pc_content_api", lambda: FakeContentApi())
+    monkeypatch.setattr(main, "backend_task_request_pause", lambda: None)
+
+    response = client.post(f"/api/search-tasks/{task_id}/run")
+    assert response.status_code == 200
+
+    result_response = client.get("/api/search-results", params={"task_id": task_id})
+    assert result_response.status_code == 200
+    assert len(result_response.json()["results"]) == 1
+
+
+def test_run_search_task_now_allows_stale_running_task(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    create_worker_cookie(client, "worker-search", ["worker_search"])
+    response = client.post(
+        "/api/search-tasks",
+        json={"keyword": "酒店", "group_name": "", "require_num": 1, "interval_minutes": 120},
+    )
+    task_id = response.json()["task"]["id"]
+
+    with get_session_factory()() as session:
+        task = session.get(SearchTask, task_id)
+        worker = session.execute(select(Account).where(Account.account_type == "worker")).scalar_one()
+        assert task is not None
+        task.task_status = "running"
+        task.claim_expires_at = utc_now() - timedelta(minutes=1)
+        worker.last_check_at = utc_now().replace(tzinfo=None)
+        session.commit()
+
+    class FakeContentApi:
+        def search_some_note(self, keyword, require_num, cookies, sort_type_choice=0, note_type=0, note_time=0):
+            return True, "成功", []
+
+    monkeypatch.setattr(main, "get_pc_content_api", lambda: FakeContentApi())
+    monkeypatch.setattr(main, "backend_task_request_pause", lambda: None)
+
+    response = client.post(f"/api/search-tasks/{task_id}/run")
+    assert response.status_code == 200
+
+
+def test_run_analytics_task_now_ignores_due_window(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    account_id = create_primary_account(client)
+    create_worker_cookie(client, "worker-analytics", ["worker_analytics"])
+    response = client.post("/api/analytics-tasks", json={"account_id": account_id, "group_name": ""})
+    assert response.status_code == 200
+    task_id = response.json()["task"]["id"]
+
+    with get_session_factory()() as session:
+        task = session.get(main.AnalyticsTask, task_id)
+        account = session.get(Account, account_id)
+        worker = session.execute(select(Account).where(Account.account_type == "worker")).scalar_one()
+        assert task is not None
+        assert account is not None
+        task.last_run_at = utc_now()
+        account.user_uid = "uid-1"
+        worker.last_check_at = utc_now().replace(tzinfo=None)
+        session.commit()
+
+    class FakeContentApi:
+        def get_user_info(self, user_id: str, cookies_str: str, proxies=None):
+            return True, "成功", {
+                "success": True,
+                "data": {"nickname": "主账号昵称", "fans_count": 10, "follow_count": 2, "interaction": 30},
+            }
+
+        def get_user_note_info(self, user_id: str, cursor: str, cookies_str: str, xsec_token="", xsec_source="", proxies=None):
+            return True, "成功", {"success": True, "data": {"notes": []}}
+
+        def get_user_self_info2(self, cookies_str: str, proxies=None):
+            return True, "成功", {"success": True, "data": {"avatar": "https://img.example.com/avatar.jpg"}}
+
+    class FakeCreatorApi:
+        def get_all_publish_note_info(self, cookies_str: str):
+            return False, "skip", []
+
+    monkeypatch.setattr(main, "get_pc_content_api", lambda: FakeContentApi())
+    monkeypatch.setattr(main, "get_creator_api", lambda: FakeCreatorApi())
+    monkeypatch.setattr(main, "backend_task_request_pause", lambda: None)
+
+    response = client.post(f"/api/analytics-tasks/{task_id}/run")
+    assert response.status_code == 200
+
+    snapshot_response = client.get("/api/analytics-snapshots", params={"account_id": account_id})
+    assert snapshot_response.status_code == 200
+    assert len(snapshot_response.json()["snapshots"]) == 1
+
+
+def test_run_analytics_task_now_allows_stale_running_task(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    account_id = create_primary_account(client)
+    create_worker_cookie(client, "worker-analytics", ["worker_analytics"])
+    response = client.post("/api/analytics-tasks", json={"account_id": account_id, "group_name": ""})
+    task_id = response.json()["task"]["id"]
+
+    with get_session_factory()() as session:
+        task = session.get(main.AnalyticsTask, task_id)
+        account = session.get(Account, account_id)
+        worker = session.execute(select(Account).where(Account.account_type == "worker")).scalar_one()
+        assert task is not None
+        assert account is not None
+        task.task_status = "running"
+        task.claim_expires_at = utc_now() - timedelta(minutes=1)
+        account.user_uid = "uid-1"
+        worker.last_check_at = utc_now().replace(tzinfo=None)
+        session.commit()
+
+    class FakeContentApi:
+        def get_user_info(self, user_id: str, cookies_str: str, proxies=None):
+            return True, "成功", {"success": True, "data": {"nickname": "主账号昵称", "fans_count": 1, "follow_count": 1, "interaction": 1}}
+
+        def get_user_note_info(self, user_id: str, cursor: str, cookies_str: str, xsec_token="", xsec_source="", proxies=None):
+            return True, "成功", {"success": True, "data": {"notes": []}}
+
+        def get_user_self_info2(self, cookies_str: str, proxies=None):
+            return True, "成功", {"success": True, "data": {"avatar": "https://img.example.com/avatar.jpg"}}
+
+    class FakeCreatorApi:
+        def get_all_publish_note_info(self, cookies_str: str):
+            return False, "skip", []
+
+    monkeypatch.setattr(main, "get_pc_content_api", lambda: FakeContentApi())
+    monkeypatch.setattr(main, "get_creator_api", lambda: FakeCreatorApi())
+    monkeypatch.setattr(main, "backend_task_request_pause", lambda: None)
+
+    response = client.post(f"/api/analytics-tasks/{task_id}/run")
+    assert response.status_code == 200
+
+
+def test_app_next_task_only_returns_publish_task(client: TestClient):
+    account_id = create_primary_account(client, bound_device_id="android-001")
+    client.post(
+        "/api/search-tasks",
+        json={"keyword": "酒店", "group_name": "", "require_num": 2, "interval_minutes": 120},
+    )
+    response = client.get("/api/app/tasks/next", params={"device_id": "android-001", "app_instance_id": "app-1"})
+    assert response.status_code == 200
+    assert response.json()["task"] is None
+
+    client.post(
+        "/api/publish-tasks",
+        json={
+            "account_id": account_id,
+            "title": "Title",
+            "desc": "Body",
+            "media_type": "image",
+            "media_urls": ["https://example.com/a.jpg"],
+            "review_status": "approved",
+        },
+    )
+    response = client.get("/api/app/tasks/next", params={"device_id": "android-001", "app_instance_id": "app-1"})
+    assert response.status_code == 200
+    assert response.json()["task_type"] == "publish"
 
 
 def test_summary_uses_database_aggregates(client: TestClient):

@@ -190,9 +190,7 @@ Content-Type: application/json
 {
   "name": "采集小号01",
   "cookies": "cookie string",
-  "remark": "搜索池A",
-  "usage_tags": ["worker_search"],
-  "group_name": "brand_a"
+  "remark": "搜索小号"
 }
 ```
 
@@ -247,9 +245,7 @@ Content-Type: application/json
 ```json
 {
   "status": "active",
-  "remark": "恢复使用",
-  "usage_tags": ["worker_search", "worker_backup"],
-  "group_name": "brand_a"
+  "remark": "恢复使用"
 }
 ```
 
@@ -259,6 +255,22 @@ Content-Type: application/json
 POST /api/cookie-workers/{worker_id}/check
 POST /api/accounts/primary/{account_id}/check
 ```
+
+说明：
+
+- 当前校验会真实请求小红书接口验证登录态，不再只做 Cookie 长度检查。
+- 非强制场景下，后端会复用 10 分钟内的最近校验结果，减少重复请求。
+
+### 2.9 媒体代理
+
+```http
+GET /api/media-proxy?url=https%3A%2F%2Fcdn.example.com%2Fcover.jpg
+```
+
+说明：
+
+- Web 页面展示发帖任务封面、图片时应优先走该接口，避免浏览器直接加载外链失败。
+- 仅支持 `http` 和 `https` 地址。
 
 ## 3. 发帖任务
 
@@ -283,6 +295,11 @@ Content-Type: application/json
   "review_status": "approved"
 }
 ```
+
+说明：
+
+- 当前 Web 管理台默认直接按 `review_status=approved` 创建任务，不再提供通过/拒绝审核按钮。
+- Web 页面只展示 `待发布`、`发布成功`、`发布失败` 三种业务状态；内部 `claimed`、`running` 等状态归并为待发布或执行中提示。
 
 ### 3.2 获取发帖任务列表
 
@@ -310,6 +327,11 @@ Content-Type: application/json
   "remark": "人工审核通过"
 }
 ```
+
+说明：
+
+- 该接口仍保留 `review_status` 字段，便于兼容已有数据和后端能力。
+- 当前 Web 管理台不暴露人工通过/拒绝操作，失败任务主要通过重新入队处理。
 
 ### 3.5 重新入队发帖任务
 
@@ -581,7 +603,25 @@ Content-Type: application/json
 POST /api/search-tasks/{task_id}/requeue
 ```
 
-### 4.5 App 拉取待执行采集任务
+### 4.4.1 删除关键词任务
+
+```http
+DELETE /api/search-tasks/{task_id}
+```
+
+### 4.5 手动立即执行关键词任务
+
+```http
+POST /api/search-tasks/{task_id}/run
+```
+
+说明：
+
+- 该接口按任务 ID 强制立即执行，不受 `interval_minutes` 到期窗口限制。
+- 仍会校验任务启用状态、小号可用状态和 Cookie 登录态。
+- 如果任务只是残留在 `claimed` 或 `running`，但领取已过期，接口会自动接管并重跑。
+
+### 4.6 App 拉取待执行采集任务
 
 ```http
 GET /api/app/search-tasks/next?device_id=android-001&app_instance_id=app-instance-001
@@ -605,7 +645,12 @@ GET /api/app/search-tasks/next?device_id=android-001&app_instance_id=app-instanc
 
 说明：首期搜索任务由 App 使用本地登录态执行，`worker_cookie_id` 仅在后续启用小号池时返回。
 
-### 4.6 App 回传采集结果
+当前版本说明：
+
+- 关键词任务默认由后端定时调度执行，Android 不再依赖该接口执行任务。
+- 该接口仅保留给调试或兼容场景。
+
+### 4.7 App 回传采集结果
 
 ```http
 POST /api/app/search-tasks/{task_id}/result
@@ -639,13 +684,13 @@ Content-Type: application/json
 
 `worker_cookie_id` 在首期可由后端兼容为空；如后续启用小号池，则必须回传实际使用的小号。
 
-### 4.7 查看采集结果
+### 4.8 查看采集结果
 
 ```http
 GET /api/search-results?task_id=task_id
 ```
 
-### 4.8 更新采集结果审核状态
+### 4.9 更新采集结果审核状态
 
 ```http
 PATCH /api/search-results/{result_id}
@@ -705,7 +750,25 @@ Content-Type: application/json
 POST /api/analytics-tasks/{task_id}/requeue
 ```
 
-### 5.5 App 拉取待执行监控任务
+### 5.4.1 删除监控任务
+
+```http
+DELETE /api/analytics-tasks/{task_id}
+```
+
+### 5.5 手动立即执行监控任务
+
+```http
+POST /api/analytics-tasks/{task_id}/run
+```
+
+说明：
+
+- 该接口按任务 ID 强制立即执行，不受 `interval_minutes` 到期窗口限制。
+- 仍会校验任务启用状态、小号可用状态和 Cookie 登录态。
+- 如果任务只是残留在 `claimed` 或 `running`，但领取已过期，接口会自动接管并重跑。
+
+### 5.6 App 拉取待执行监控任务
 
 ```http
 GET /api/app/analytics-tasks/next?device_id=android-001&app_instance_id=app-instance-001
@@ -724,7 +787,12 @@ GET /api/app/analytics-tasks/next?device_id=android-001&app_instance_id=app-inst
 }
 ```
 
-### 5.6 App 回传监控快照
+当前版本说明：
+
+- 账号监控任务默认由后端定时调度执行，Android 不再依赖该接口执行任务。
+- 该接口仅保留给调试或兼容场景。
+
+### 5.7 App 回传监控快照
 
 ```http
 POST /api/app/analytics-tasks/{task_id}/result
@@ -757,7 +825,7 @@ Content-Type: application/json
 }
 ```
 
-### 5.7 查看监控快照
+### 5.8 查看监控快照
 
 ```http
 GET /api/analytics-snapshots?account_id=primary_account_id
@@ -767,7 +835,7 @@ GET /api/analytics-snapshots?account_id=primary_account_id
 
 ### 6.1 统一拉取下一个任务
 
-App 正式接入建议使用该接口拉取后台创建的发帖任务。搜索任务由 App 创建，也可通过分类型接口或统一接口领取执行。
+App 正式接入建议使用该接口拉取后台创建的发帖任务。
 
 ```http
 GET /api/app/tasks/next?device_id=android-001&app_instance_id=app-instance-001&app_version=1.0.0&device_name=Pixel
@@ -786,15 +854,34 @@ GET /api/app/tasks/next?device_id=android-001&app_instance_id=app-instance-001&a
 
 ```json
 {
-  "task_type": "search",
+  "task_type": "publish",
   "task": {
     "id": "task_id",
-    "keyword": "新加坡 qt",
-    "worker_cookie_id": "worker_id",
+    "title": "标题",
     "claim_expires_at": "2026-05-09T10:15:00+08:00"
   }
 }
 ```
+
+### 6.1.1 后端手动触发到期任务
+
+```http
+POST /api/ops/run-due-tasks
+```
+
+```json
+{
+  "result": {
+    "search": true,
+    "analytics": false
+  }
+}
+```
+
+说明：
+
+- 该接口只跑当前已到期的关键词任务和监控任务。
+- Web 列表顶部“立即执行一轮”对应这个接口，不等于强制执行单条任务。
 
 ### 6.2 统一回传任务结果
 

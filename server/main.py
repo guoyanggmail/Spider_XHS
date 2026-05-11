@@ -2,17 +2,21 @@ from __future__ import annotations
 
 import os
 import base64
+import random
 import requests
+import threading
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlparse
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
 from pydantic import BaseModel, Field, ValidationError
@@ -21,7 +25,7 @@ import qrcode.image.svg
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
-from server.db import get_database_url, get_db, init_db
+from server.db import get_database_url, get_db, get_session_factory, init_db
 from server.models import (
     Account,
     AccountUsageTag,
@@ -51,6 +55,11 @@ FRONTEND_DIST = ROOT_DIR / "frontend" / "dist"
 LOG_DIR = ROOT_DIR / "logs"
 LOGIN_SESSION_STORE: dict[str, dict] = {}
 LOGGER_CONFIGURED = False
+SCHEDULER_INTERVAL_SECONDS = int(os.getenv("BACKEND_TASK_SCHEDULER_INTERVAL_SECONDS", "15") or "15")
+BACKEND_TASK_DEVICE_ID = "backend-worker"
+BACKEND_TASK_APP_INSTANCE_ID = "backend-worker"
+TASK_SCHEDULER_STOP = threading.Event()
+TASK_SCHEDULER_THREAD: threading.Thread | None = None
 
 
 def utc_now() -> datetime:
@@ -99,10 +108,50 @@ def configure_app_logger() -> None:
 configure_app_logger()
 
 
+def backend_scheduler_enabled() -> bool:
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        return False
+    return os.getenv("DISABLE_BACKEND_TASK_SCHEDULER", "").lower() not in {"1", "true", "yes"}
+
+
+def backend_task_request_pause() -> None:
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        return
+    time.sleep(random.uniform(2.0, 6.0))
+
+
+def scheduler_loop() -> None:
+    while not TASK_SCHEDULER_STOP.wait(SCHEDULER_INTERVAL_SECONDS):
+        try:
+            run_backend_task_cycle_once()
+        except Exception as exc:
+            logger.exception("backend task scheduler cycle failed error={}", exc)
+
+
+def start_backend_task_scheduler() -> None:
+    global TASK_SCHEDULER_THREAD
+    if not backend_scheduler_enabled():
+        return
+    if TASK_SCHEDULER_THREAD and TASK_SCHEDULER_THREAD.is_alive():
+        return
+    TASK_SCHEDULER_STOP.clear()
+    TASK_SCHEDULER_THREAD = threading.Thread(target=scheduler_loop, name="backend-task-scheduler", daemon=True)
+    TASK_SCHEDULER_THREAD.start()
+    logger.info("backend task scheduler started interval_seconds={}", SCHEDULER_INTERVAL_SECONDS)
+
+
+def stop_backend_task_scheduler() -> None:
+    TASK_SCHEDULER_STOP.set()
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
-    yield
+    start_backend_task_scheduler()
+    try:
+        yield
+    finally:
+        stop_backend_task_scheduler()
 
 
 app = FastAPI(title="Spider XHS Management Backend", lifespan=lifespan)
@@ -366,7 +415,7 @@ def to_account_public(account: Account) -> dict:
         "user_uid": account.user_uid,
         "cookie_preview": account.cookie_preview,
         "status": account.status,
-        "group_name": account.group_name,
+        "group_name": "",
         "remark": account.remark,
         "last_check_at": account.last_check_at,
         "last_use_at": account.last_use_at,
@@ -374,10 +423,19 @@ def to_account_public(account: Account) -> dict:
         "failure_count": account.failure_count,
         "cooldown_until": account.cooldown_until,
         "bound_device_id": account.bound_device_id,
-        "usage_tags": [tag.usage_tag for tag in account.usage_tags],
+        "usage_tags": [],
         "created_at": account.created_at,
         "updated_at": account.updated_at,
     }
+
+
+def to_account_public_with_runtime(session: Session, account: Account) -> dict:
+    body = to_account_public(account)
+    if account.account_type == "worker":
+        busy = worker_is_busy(session, account.id)
+        body["is_busy"] = busy
+        body["runtime_state"] = "busy" if busy else "idle"
+    return body
 
 
 def to_publish_task(task: PublishTask) -> dict:
@@ -807,7 +865,7 @@ def get_latest_analytics_snapshot(session: Session, account_id: str) -> Analytic
     return session.execute(stmt).scalar_one_or_none()
 
 
-def build_account_profile_summary(session: Session, account: Account) -> dict:
+def build_account_profile_summary_with_worker(session: Session, account: Account, worker: Account | None) -> dict:
     summary = to_account_summary(account)
     latest_snapshot = get_latest_analytics_snapshot(session, account.id)
     if latest_snapshot:
@@ -836,7 +894,6 @@ def build_account_profile_summary(session: Session, account: Account) -> dict:
         except Exception as exc:
             logger.exception("account-summary creator fetch failed account_id={} error={}", account.id, exc)
 
-    worker = choose_worker(session, usage_tag="worker_search")
     worker_cookie_id = worker.id if worker else ""
     content_api = get_pc_content_api()
 
@@ -982,6 +1039,11 @@ def build_account_profile_summary(session: Session, account: Account) -> dict:
     return summary
 
 
+def build_account_profile_summary(session: Session, account: Account) -> dict:
+    worker = choose_worker(session)
+    return build_account_profile_summary_with_worker(session, account, worker)
+
+
 def write_audit_log(
     session: Session,
     *,
@@ -1028,9 +1090,42 @@ def set_usage_tags(session: Session, account: Account, tags: list[str]) -> None:
     session.flush()
 
 
+def update_account_identity_from_self_info(account: Account, payload: dict | None) -> None:
+    data = ((payload or {}).get("data") or {}) if isinstance(payload, dict) else {}
+    if not isinstance(data, dict):
+        return
+    nickname = (
+        data.get("nickname")
+        or data.get("nick_name")
+        or data.get("name")
+        or data.get("red_id")
+        or ""
+    )
+    user_uid = (
+        data.get("user_id")
+        or data.get("userid")
+        or data.get("uid")
+        or data.get("red_id")
+        or ""
+    )
+    if nickname:
+        account.nickname = str(nickname)
+    if user_uid:
+        account.user_uid = str(user_uid)
+
+
+def ensure_aware_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 def refresh_account_status(account: Account) -> None:
     now = utc_now()
-    if account.status == "cooldown" and account.cooldown_until and account.cooldown_until <= now:
+    cooldown_until = ensure_aware_utc(account.cooldown_until)
+    if account.status == "cooldown" and cooldown_until and cooldown_until <= now:
         account.status = "active"
         account.cooldown_until = None
 
@@ -1055,10 +1150,30 @@ def mark_account_failure(account: Account, message: str = "") -> None:
         account.cooldown_until = utc_now() + timedelta(seconds=FAILURE_COOLDOWN_SECONDS)
 
 
-def validate_cookie(account: Account) -> tuple[bool, str]:
+def validate_cookie(account: Account, *, force: bool = False) -> tuple[bool, str]:
     if len((account.cookies or "").strip()) < 20:
         return False, "Cookie 长度不足"
-    return True, "Cookie 可用"
+    last_check_at = ensure_aware_utc(account.last_check_at)
+    if (
+        not force
+        and last_check_at
+        and last_check_at >= utc_now() - timedelta(seconds=COOKIE_CHECK_TTL_SECONDS)
+        and account.status in {"active", "invalid"}
+    ):
+        return (account.status == "active"), ("Cookie 可用" if account.status == "active" else "登录已失效")
+
+    api = get_pc_content_api()
+    try:
+        success, message, payload = api.get_user_self_info2(account.cookies)
+    except Exception as exc:
+        return False, str(exc) or "Cookie 校验失败"
+    if success:
+        update_account_identity_from_self_info(account, payload)
+        return True, "Cookie 可用"
+    lowered = (message or "").lower()
+    if "login" in lowered or "登录" in (message or "") or "cookie" in lowered or "invalid" in lowered:
+        return False, message or "登录已失效"
+    return False, message or "Cookie 校验失败"
 
 
 def ensure_account_session_available(account: Account) -> None:
@@ -1085,6 +1200,87 @@ def download_media_bytes(url: str) -> bytes:
     response = requests.get(url, timeout=30)
     response.raise_for_status()
     return response.content
+
+
+def normalize_remote_media_url(url: str) -> str:
+    candidate = (url or "").strip()
+    if not candidate:
+        raise HTTPException(status_code=400, detail="媒体地址不能为空")
+    parsed = urlparse(candidate)
+    if parsed.scheme not in {"http", "https"}:
+        raise HTTPException(status_code=400, detail="仅支持 http 或 https 媒体地址")
+    if not parsed.netloc:
+        raise HTTPException(status_code=400, detail="媒体地址不完整")
+    return candidate
+
+
+def proxy_remote_media(url: str) -> Response:
+    normalized = normalize_remote_media_url(url)
+    try:
+        upstream = requests.get(
+            normalized,
+            timeout=30,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+                ),
+                "Referer": "https://www.xiaohongshu.com/",
+            },
+        )
+        upstream.raise_for_status()
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=f"媒体代理失败: {exc}") from exc
+    content_type = upstream.headers.get("content-type") or "application/octet-stream"
+    return Response(
+        content=upstream.content,
+        media_type=content_type,
+        headers={
+            "Cache-Control": "public, max-age=300",
+            "X-Proxy-Source": "media-proxy",
+        },
+    )
+
+
+def coerce_optional_datetime(value) -> datetime | None:
+    if isinstance(value, datetime):
+        return ensure_aware_utc(value)
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(value, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    if isinstance(value, str):
+        candidate = value.strip()
+        if not candidate:
+            return None
+        try:
+            return datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+        except ValueError:
+            if candidate.isdigit():
+                try:
+                    timestamp = int(candidate)
+                    if len(candidate) >= 13:
+                        timestamp = timestamp / 1000
+                    return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+                except (OverflowError, OSError, ValueError):
+                    return None
+    return None
+
+
+def to_json_safe(value):
+    if isinstance(value, datetime):
+        normalized = ensure_aware_utc(value)
+        return normalized.isoformat() if normalized else None
+    if isinstance(value, list):
+        return [to_json_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return [to_json_safe(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): to_json_safe(item) for key, item in value.items()}
+    return value
 
 
 def extract_publish_result_fields(res_json: dict | None) -> tuple[str, str]:
@@ -1710,13 +1906,12 @@ def create_worker_account_from_login(
         cookies=cookies_str,
         cookie_preview=mask_cookie(cookies_str),
         status="active",
-        group_name=group_name.strip(),
+        group_name="",
         remark=remark.strip(),
         last_check_at=utc_now(),
     )
     session.add(worker)
     session.flush()
-    set_usage_tags(session, worker, usage_tags)
     write_audit_log(
         session,
         log_type="manual_action",
@@ -1725,7 +1920,7 @@ def create_worker_account_from_login(
         target_type="account",
         target_id=worker.id,
         message=source_message,
-        payload={"group_name": worker.group_name, "usage_tags": usage_tags},
+        payload={},
     )
     return worker
 
@@ -1860,7 +2055,7 @@ def worker_is_busy(session: Session, worker_id: str) -> bool:
     return False
 
 
-def choose_worker(session: Session, *, usage_tag: str, group_name: str = "") -> Account | None:
+def choose_worker(session: Session) -> Account | None:
     reclaim_expired_claims(session)
     stmt = (
         select(Account)
@@ -1874,12 +2069,8 @@ def choose_worker(session: Session, *, usage_tag: str, group_name: str = "") -> 
         refresh_account_status(worker)
         if worker.status != "active":
             continue
-        if group_name and worker.group_name != group_name:
-            continue
-        tags = {item.usage_tag for item in worker.usage_tags}
-        if usage_tag not in tags and "worker_backup" not in tags:
-            continue
-        if worker.cooldown_until and worker.cooldown_until > now:
+        cooldown_until = ensure_aware_utc(worker.cooldown_until)
+        if cooldown_until and cooldown_until > now:
             continue
         if worker_is_busy(session, worker.id):
             continue
@@ -1973,9 +2164,10 @@ def claim_publish_task(session: Session, device_id: str) -> PublishTask | None:
 def search_task_due(task: SearchTask) -> bool:
     if not task.enabled or task.task_status != "pending":
         return False
-    if task.last_run_at is None:
+    last_run_at = ensure_aware_utc(task.last_run_at)
+    if last_run_at is None:
         return True
-    return task.last_run_at <= utc_now() - timedelta(minutes=task.interval_minutes)
+    return last_run_at <= utc_now() - timedelta(minutes=task.interval_minutes)
 
 
 def claim_search_task(session: Session, device_id: str) -> tuple[SearchTask, Account | None] | None:
@@ -1986,7 +2178,7 @@ def claim_search_task(session: Session, device_id: str) -> tuple[SearchTask, Acc
     for task in session.execute(stmt).scalars():
         if not search_task_due(task):
             continue
-        worker = choose_worker(session, usage_tag="worker_search", group_name=task.group_name)
+        worker = choose_worker(session)
         task.task_status = "claimed"
         task.claimed_by_device_id = device_id
         task.assigned_worker_account_id = worker.id if worker else None
@@ -2008,9 +2200,342 @@ def claim_search_task(session: Session, device_id: str) -> tuple[SearchTask, Acc
 def analytics_task_due(task: AnalyticsTask) -> bool:
     if not task.enabled or task.task_status != "pending":
         return False
-    if task.last_run_at is None:
+    last_run_at = ensure_aware_utc(task.last_run_at)
+    if last_run_at is None:
         return True
-    return task.last_run_at <= utc_now() - timedelta(minutes=task.interval_minutes)
+    return last_run_at <= utc_now() - timedelta(minutes=task.interval_minutes)
+
+
+def task_has_active_execution(task) -> bool:
+    if task.task_status not in {"claimed", "running"}:
+        return False
+    claim_expires_at = ensure_aware_utc(getattr(task, "claim_expires_at", None))
+    if claim_expires_at is None:
+        return task.task_status == "running"
+    return claim_expires_at > utc_now()
+
+
+def choose_backend_analytics_worker(session: Session) -> Account | None:
+    return choose_worker(session)
+
+
+def mark_backend_task_running(
+    session: Session,
+    task: SearchTask | AnalyticsTask,
+    worker: Account,
+    *,
+    task_type: str,
+) -> None:
+    task.task_status = "running"
+    task.claimed_by_device_id = BACKEND_TASK_DEVICE_ID
+    task.claim_expires_at = utc_now() + timedelta(minutes=CLAIM_TIMEOUT_MINUTES)
+    task.assigned_worker_account_id = worker.id
+    write_audit_log(
+        session,
+        log_type="task_claim",
+        operator_type="system",
+        operator_id=BACKEND_TASK_DEVICE_ID,
+        target_type=f"{task_type}_task",
+        target_id=task.id,
+        message=f"后端开始执行{ '关键词采集' if task_type == 'search' else '账号监控' }任务",
+        payload={"worker_account_id": worker.id},
+    )
+
+
+def complete_backend_search_task(session: Session, task: SearchTask, worker: Account, notes: list[dict]) -> None:
+    result_id = f"backend-search-{uuid4().hex}"
+    save_task_result(
+        session,
+        task_type="search",
+        task_id=task.id,
+        result_id=result_id,
+        device_id=BACKEND_TASK_DEVICE_ID,
+        app_instance_id=BACKEND_TASK_APP_INSTANCE_ID,
+        status="success",
+        duration_seconds=0,
+        error_message="",
+        payload={"item_count": len(notes), "source": "backend_scheduler"},
+    )
+    seen_post_ids: set[str] = set()
+    saved_count = 0
+    for raw_item in notes:
+        if raw_item.get("id") in seen_post_ids:
+            continue
+        seen_post_ids.add(raw_item.get("id"))
+        parsed = to_search_preview_item(raw_item)
+        if not parsed["post_id"]:
+            continue
+        exists_stmt = select(SearchResult).where(SearchResult.search_task_id == task.id, SearchResult.post_id == parsed["post_id"])
+        exists = session.execute(exists_stmt).scalar_one_or_none()
+        if exists:
+            continue
+        session.add(
+            SearchResult(
+                search_task_id=task.id,
+                result_id=result_id,
+                worker_account_id=worker.id,
+                post_id=parsed["post_id"],
+                post_url=parsed["post_url"],
+                title=parsed["title"],
+                content_preview=parsed["content_preview"],
+                author_id=parsed["author_id"],
+                author_name=parsed["author_name"],
+                like_count=parsed["like_count"],
+                comment_count=parsed["comment_count"],
+                collect_count=parsed["collect_count"],
+                publish_time=coerce_optional_datetime(parsed["publish_time"]),
+                raw_payload=parsed,
+            )
+        )
+        saved_count += 1
+    task.task_status = "pending"
+    task.claimed_by_device_id = ""
+    task.claim_expires_at = None
+    task.assigned_worker_account_id = None
+    task.last_run_at = utc_now()
+    task.last_success_at = utc_now()
+    task.last_error = ""
+    task.retry_count = 0
+    mark_account_success(worker)
+    write_audit_log(
+        session,
+        log_type="app_result",
+        operator_type="system",
+        operator_id=BACKEND_TASK_DEVICE_ID,
+        target_type="search_task",
+        target_id=task.id,
+        message="后端完成关键词采集任务",
+        payload={"saved_count": saved_count, "worker_account_id": worker.id},
+    )
+
+
+def fail_backend_search_task(session: Session, task: SearchTask, worker: Account | None, message: str) -> None:
+    save_task_result(
+        session,
+        task_type="search",
+        task_id=task.id,
+        result_id=f"backend-search-{uuid4().hex}",
+        device_id=BACKEND_TASK_DEVICE_ID,
+        app_instance_id=BACKEND_TASK_APP_INSTANCE_ID,
+        status="failed",
+        duration_seconds=0,
+        error_message=message,
+        payload={"source": "backend_scheduler"},
+    )
+    task.task_status = "pending"
+    task.claimed_by_device_id = ""
+    task.claim_expires_at = None
+    task.assigned_worker_account_id = None
+    task.last_run_at = utc_now()
+    task.last_error = message
+    task.retry_count += 1
+    if worker:
+        mark_account_failure(worker, message)
+    write_audit_log(
+        session,
+        log_type="task_error",
+        operator_type="system",
+        operator_id=BACKEND_TASK_DEVICE_ID,
+        target_type="search_task",
+        target_id=task.id,
+        message="后端关键词采集任务失败",
+        payload={"error": message, "worker_account_id": worker.id if worker else ""},
+    )
+
+
+def run_search_task_once(session: Session, task: SearchTask) -> bool:
+    worker = choose_worker(session)
+    if not worker:
+        fail_backend_search_task(session, task, None, "当前没有可用的搜索小号")
+        session.commit()
+        return True
+    ok, message = validate_cookie(worker)
+    worker.last_check_at = utc_now()
+    if not ok:
+        fail_backend_search_task(session, task, worker, message)
+        session.commit()
+        return True
+    mark_backend_task_running(session, task, worker, task_type="search")
+    session.commit()
+    backend_task_request_pause()
+    api = get_pc_content_api()
+    success, search_message, notes = api.search_some_note(
+        task.keyword.strip(),
+        task.require_num,
+        worker.cookies,
+        sort_type_choice=map_sort_type(task.sort_type),
+        note_type=map_note_type(task.note_type),
+        note_time=map_time_range(task.time_range),
+    )
+    task = session.get(SearchTask, task.id)
+    worker = require_account(session, worker.id, "worker")
+    if not task:
+        return True
+    if not success:
+        fail_backend_search_task(session, task, worker, search_message or "搜索失败")
+        session.commit()
+        return True
+    complete_backend_search_task(session, task, worker, notes or [])
+    session.commit()
+    return True
+
+
+def run_due_search_task_once(session: Session) -> bool:
+    reclaim_expired_claims(session)
+    stmt = select(SearchTask).order_by(SearchTask.last_run_at.asc().nullsfirst(), SearchTask.created_at.asc())
+    for task in session.execute(stmt).scalars():
+        if not search_task_due(task):
+            continue
+        return run_search_task_once(session, task)
+    return False
+
+
+def complete_backend_analytics_task(session: Session, task: AnalyticsTask, worker: Account, summary: dict) -> None:
+    result_id = f"backend-analytics-{uuid4().hex}"
+    safe_summary = to_json_safe(summary)
+    save_task_result(
+        session,
+        task_type="analytics",
+        task_id=task.id,
+        result_id=result_id,
+        device_id=BACKEND_TASK_DEVICE_ID,
+        app_instance_id=BACKEND_TASK_APP_INSTANCE_ID,
+        status="success",
+        duration_seconds=0,
+        error_message="",
+        payload={"source": "backend_scheduler"},
+    )
+    snapshot = AnalyticsSnapshot(
+        analytics_task_id=task.id,
+        result_id=result_id,
+        account_id=task.account_id,
+        worker_account_id=worker.id,
+        nickname=summary.get("nickname", ""),
+        follower_count=summary.get("follower_count", 0),
+        liked_total=summary.get("liked_count", 0),
+        post_total=len(summary.get("published_notes", [])),
+        collected_total=summary.get("collected_total"),
+        raw_payload=safe_summary,
+    )
+    session.add(snapshot)
+    session.flush()
+    for post in summary.get("published_notes", []):
+        safe_post = to_json_safe(post)
+        session.add(
+            AnalyticsSnapshotPost(
+                snapshot_id=snapshot.id,
+                post_id=post.get("post_id", ""),
+                title=post.get("title", ""),
+                post_url=post.get("post_url", ""),
+                like_count=post.get("like_count", 0),
+                comment_count=post.get("comment_count", 0),
+                collect_count=post.get("collect_count", 0),
+                publish_time=coerce_optional_datetime(post.get("publish_time")),
+                raw_payload=safe_post,
+            )
+        )
+    task.task_status = "pending"
+    task.claimed_by_device_id = ""
+    task.claim_expires_at = None
+    task.assigned_worker_account_id = None
+    task.last_run_at = utc_now()
+    task.last_success_at = utc_now()
+    task.last_error = ""
+    task.retry_count = 0
+    mark_account_success(worker)
+    write_audit_log(
+        session,
+        log_type="app_result",
+        operator_type="system",
+        operator_id=BACKEND_TASK_DEVICE_ID,
+        target_type="analytics_task",
+        target_id=task.id,
+        message="后端完成账号监控任务",
+        payload={"snapshot_id": snapshot.id, "worker_account_id": worker.id},
+    )
+
+
+def fail_backend_analytics_task(session: Session, task: AnalyticsTask, worker: Account | None, message: str) -> None:
+    save_task_result(
+        session,
+        task_type="analytics",
+        task_id=task.id,
+        result_id=f"backend-analytics-{uuid4().hex}",
+        device_id=BACKEND_TASK_DEVICE_ID,
+        app_instance_id=BACKEND_TASK_APP_INSTANCE_ID,
+        status="failed",
+        duration_seconds=0,
+        error_message=message,
+        payload={"source": "backend_scheduler"},
+    )
+    task.task_status = "pending"
+    task.claimed_by_device_id = ""
+    task.claim_expires_at = None
+    task.assigned_worker_account_id = None
+    task.last_run_at = utc_now()
+    task.last_error = message
+    task.retry_count += 1
+    if worker:
+        mark_account_failure(worker, message)
+    write_audit_log(
+        session,
+        log_type="task_error",
+        operator_type="system",
+        operator_id=BACKEND_TASK_DEVICE_ID,
+        target_type="analytics_task",
+        target_id=task.id,
+        message="后端账号监控任务失败",
+        payload={"error": message, "worker_account_id": worker.id if worker else ""},
+    )
+
+
+def run_analytics_task_once(session: Session, task: AnalyticsTask) -> bool:
+    worker = choose_backend_analytics_worker(session)
+    if not worker:
+        fail_backend_analytics_task(session, task, None, "当前没有可用的小号用于账号监控")
+        session.commit()
+        return True
+    ok, message = validate_cookie(worker)
+    worker.last_check_at = utc_now()
+    if not ok:
+        fail_backend_analytics_task(session, task, worker, message)
+        session.commit()
+        return True
+    mark_backend_task_running(session, task, worker, task_type="analytics")
+    session.commit()
+    backend_task_request_pause()
+    task = session.get(AnalyticsTask, task.id)
+    if not task:
+        return True
+    account = require_account(session, task.account_id, "primary")
+    try:
+        summary = build_account_profile_summary_with_worker(session, account, worker)
+    except Exception as exc:
+        logger.exception("backend analytics task failed task_id={} error={}", task.id, exc)
+        fail_backend_analytics_task(session, task, worker, str(exc) or "账号监控执行失败")
+        session.commit()
+        return True
+    complete_backend_analytics_task(session, task, worker, summary)
+    session.commit()
+    return True
+
+
+def run_due_analytics_task_once(session: Session) -> bool:
+    reclaim_expired_claims(session)
+    stmt = select(AnalyticsTask).order_by(AnalyticsTask.last_run_at.asc().nullsfirst(), AnalyticsTask.created_at.asc())
+    for task in session.execute(stmt).scalars():
+        if not analytics_task_due(task):
+            continue
+        return run_analytics_task_once(session, task)
+    return False
+
+
+def run_backend_task_cycle_once() -> dict[str, bool]:
+    session_factory = get_session_factory()
+    with session_factory() as session:
+        search_ran = run_due_search_task_once(session)
+        analytics_ran = run_due_analytics_task_once(session)
+        return {"search": search_ran, "analytics": analytics_ran}
 
 
 def claim_analytics_task(session: Session, device_id: str) -> tuple[AnalyticsTask, Account] | None:
@@ -2021,7 +2546,7 @@ def claim_analytics_task(session: Session, device_id: str) -> tuple[AnalyticsTas
     for task in session.execute(stmt).scalars():
         if not analytics_task_due(task):
             continue
-        worker = choose_worker(session, usage_tag="worker_analytics", group_name=task.group_name)
+        worker = choose_backend_analytics_worker(session)
         if not worker:
             continue
         task.task_status = "claimed"
@@ -2052,8 +2577,8 @@ def list_accounts(session: Session = Depends(get_db)) -> dict:
     stmt = select(Account).options(selectinload(Account.usage_tags)).order_by(Account.created_at.desc())
     accounts = session.execute(stmt).scalars().all()
     return {
-        "primary_accounts": [to_account_public(item) for item in accounts if item.account_type == "primary"],
-        "worker_cookies": [to_account_public(item) for item in accounts if item.account_type == "worker"],
+        "primary_accounts": [to_account_public_with_runtime(session, item) for item in accounts if item.account_type == "primary"],
+        "worker_cookies": [to_account_public_with_runtime(session, item) for item in accounts if item.account_type == "worker"],
     }
 
 
@@ -2088,7 +2613,7 @@ def create_primary_account(payload: PrimaryAccountCreate, session: Session = Dep
 @app.post("/api/accounts/primary/{account_id}/check")
 def check_primary_account(account_id: str, session: Session = Depends(get_db)) -> dict:
     account = require_account(session, account_id, "primary")
-    ok, message = validate_cookie(account)
+    ok, message = validate_cookie(account, force=True)
     account.last_check_at = utc_now()
     if ok:
         account.status = "active"
@@ -2097,7 +2622,7 @@ def check_primary_account(account_id: str, session: Session = Depends(get_db)) -
         mark_account_failure(account, message)
     session.commit()
     session.refresh(account)
-    return {"success": ok, "message": message, "account": to_account_public(account)}
+    return {"success": ok, "message": message, "account": to_account_public_with_runtime(session, account)}
 
 
 @app.post("/api/app/auth/sync-cookie")
@@ -2205,7 +2730,7 @@ def app_account_summary(account_id: str, session: Session = Depends(get_db)) -> 
 @app.post("/api/app/accounts/{account_id}/check")
 def app_check_account_summary(account_id: str, session: Session = Depends(get_db)) -> dict:
     account = require_account(session, account_id, "primary")
-    ok, message = validate_cookie(account)
+    ok, message = validate_cookie(account, force=True)
     account.last_check_at = utc_now()
     if ok:
         account.status = "active"
@@ -2229,7 +2754,7 @@ def list_cookie_workers(session: Session = Depends(get_db)) -> dict:
         .where(Account.account_type == "worker")
         .order_by(Account.created_at.desc())
     )
-    return {"worker_cookies": [to_account_public(item) for item in session.execute(stmt).scalars().all()]}
+    return {"worker_cookies": [to_account_public_with_runtime(session, item) for item in session.execute(stmt).scalars().all()]}
 
 
 @app.post("/api/cookie-workers")
@@ -2239,15 +2764,15 @@ def create_cookie_worker(payload: WorkerCookieCreate, session: Session = Depends
         cookies_str=payload.cookies.strip(),
         nickname="",
         name=payload.name,
-        group_name=payload.group_name,
+        group_name="",
         remark=payload.remark,
-        usage_tags=payload.usage_tags,
+        usage_tags=[],
         operator_id="web",
         source_message="创建小号 Cookie",
     )
     session.commit()
     session.refresh(worker)
-    return {"worker_cookie": to_account_public(worker)}
+    return {"worker_cookie": to_account_public_with_runtime(session, worker)}
 
 
 @app.patch("/api/cookie-workers/{worker_id}")
@@ -2257,10 +2782,6 @@ def update_cookie_worker(worker_id: str, payload: WorkerCookieUpdate, session: S
         worker.status = normalize_status(payload.status, {"active", "cooldown", "invalid", "disabled"}, worker.status)
     if payload.remark is not None:
         worker.remark = payload.remark.strip()
-    if payload.group_name is not None:
-        worker.group_name = payload.group_name.strip()
-    if payload.usage_tags is not None:
-        set_usage_tags(session, worker, payload.usage_tags)
     write_audit_log(
         session,
         log_type="manual_action",
@@ -2273,13 +2794,13 @@ def update_cookie_worker(worker_id: str, payload: WorkerCookieUpdate, session: S
     )
     session.commit()
     session.refresh(worker)
-    return {"worker_cookie": to_account_public(worker)}
+    return {"worker_cookie": to_account_public_with_runtime(session, worker)}
 
 
 @app.post("/api/cookie-workers/{worker_id}/check")
 def check_cookie_worker(worker_id: str, session: Session = Depends(get_db)) -> dict:
     worker = require_account(session, worker_id, "worker")
-    ok, message = validate_cookie(worker)
+    ok, message = validate_cookie(worker, force=True)
     worker.last_check_at = utc_now()
     if ok:
         worker.status = "active"
@@ -2288,7 +2809,7 @@ def check_cookie_worker(worker_id: str, session: Session = Depends(get_db)) -> d
         mark_account_failure(worker, message)
     session.commit()
     session.refresh(worker)
-    return {"success": ok, "message": message, "worker_cookie": to_account_public(worker)}
+    return {"success": ok, "message": message, "worker_cookie": to_account_public_with_runtime(session, worker)}
 
 
 @app.post("/api/cookie-workers/auth/request-sms-code")
@@ -2343,9 +2864,9 @@ def login_worker_with_sms(payload: WorkerSmsLoginRequest, session: Session = Dep
         cookies_str=cookies_str,
         nickname=nickname,
         name=payload.name,
-        group_name=payload.group_name,
+        group_name="",
         remark=payload.remark or "手机号验证码登录创建",
-        usage_tags=payload.usage_tags,
+        usage_tags=[],
         operator_id="web_sms",
         source_message="手机号验证码登录创建小号",
     )
@@ -2355,7 +2876,7 @@ def login_worker_with_sms(payload: WorkerSmsLoginRequest, session: Session = Dep
     return {
         "success": True,
         "message": message or "登录成功",
-        "worker_cookie": to_account_public(worker),
+        "worker_cookie": to_account_public_with_runtime(session, worker),
         "user_info": user_info if user_ok else {},
     }
 
@@ -2418,9 +2939,9 @@ def check_worker_qrcode(payload: WorkerQrCodeCheckRequest, session: Session = De
         cookies_str=cookies_str,
         nickname=nickname,
         name=payload.name,
-        group_name=payload.group_name,
+        group_name="",
         remark=payload.remark or "扫码登录创建",
-        usage_tags=payload.usage_tags,
+        usage_tags=[],
         operator_id="web_qrcode",
         source_message="扫码登录创建小号",
     )
@@ -2430,7 +2951,7 @@ def check_worker_qrcode(payload: WorkerQrCodeCheckRequest, session: Session = De
     return {
         "success": True,
         "message": message or "扫码登录成功",
-        "worker_cookie": to_account_public(worker),
+        "worker_cookie": to_account_public_with_runtime(session, worker),
         "user_info": user_info if user_ok else {},
     }
 
@@ -2534,6 +3055,11 @@ def list_publish_tasks(
 def list_publish_records(session: Session = Depends(get_db)) -> dict:
     stmt = select(PublishTask).where(PublishTask.task_status == "success").order_by(PublishTask.updated_at.desc())
     return {"records": [to_publish_task(item) for item in session.execute(stmt).scalars().all()]}
+
+
+@app.get("/api/media-proxy")
+def get_media_proxy(url: str = Query(min_length=1, max_length=4000)) -> Response:
+    return proxy_remote_media(url)
 
 
 @app.patch("/api/publish-tasks/{task_id}")
@@ -2729,7 +3255,7 @@ def app_execute_publish_task(task_id: str, payload: AppPublishExecuteRequest, se
 def create_search_task(payload: SearchTaskCreate, session: Session = Depends(get_db)) -> dict:
     task = SearchTask(
         keyword=payload.keyword.strip(),
-        group_name=payload.group_name.strip(),
+        group_name="",
         require_num=payload.require_num,
         sort_type=payload.sort_type.strip(),
         note_type=payload.note_type.strip(),
@@ -2748,7 +3274,7 @@ def create_search_task(payload: SearchTaskCreate, session: Session = Depends(get
         target_type="search_task",
         target_id=task.id,
         message="创建关键词采集任务",
-        payload={"group_name": task.group_name},
+        payload={},
     )
     session.commit()
     session.refresh(task)
@@ -2759,7 +3285,7 @@ def create_search_task(payload: SearchTaskCreate, session: Session = Depends(get
 def app_create_search_task(payload: AppSearchTaskCreate, session: Session = Depends(get_db)) -> dict:
     task = SearchTask(
         keyword=payload.keyword.strip(),
-        group_name=payload.group_name.strip(),
+        group_name="",
         require_num=payload.require_num,
         sort_type=payload.sort_type.strip(),
         note_type=payload.note_type.strip(),
@@ -2778,7 +3304,7 @@ def app_create_search_task(payload: AppSearchTaskCreate, session: Session = Depe
         target_type="search_task",
         target_id=task.id,
         message="App 创建关键词搜索任务",
-        payload={"group_name": task.group_name},
+        payload={},
     )
     session.commit()
     session.refresh(task)
@@ -2789,7 +3315,7 @@ def app_create_search_task(payload: AppSearchTaskCreate, session: Session = Depe
 def app_search_preview(payload: AppDirectSearchRequest, session: Session = Depends(get_db)) -> dict:
     account = require_account(session, payload.account_id, "primary")
     ensure_account_session_available(account)
-    worker = choose_worker(session, usage_tag="worker_search")
+    worker = choose_worker(session)
     if not worker:
         session.commit()
         raise HTTPException(status_code=409, detail="当前没有可用的搜索小号")
@@ -2863,7 +3389,7 @@ def app_search_post_detail(payload: AppSearchPostDetailRequest, session: Session
     if payload.worker_cookie_id.strip():
         worker = require_account(session, payload.worker_cookie_id.strip(), "worker")
     else:
-        worker = choose_worker(session, usage_tag="worker_search")
+        worker = choose_worker(session)
     if not worker:
         session.commit()
         raise HTTPException(status_code=409, detail="当前没有可用的搜索小号")
@@ -2986,8 +3512,6 @@ def update_search_task(task_id: str, payload: SearchTaskUpdate, session: Session
         raise HTTPException(status_code=404, detail="关键词任务不存在")
     if payload.enabled is not None:
         task.enabled = payload.enabled
-    if payload.group_name is not None:
-        task.group_name = payload.group_name.strip()
     if payload.require_num is not None:
         task.require_num = payload.require_num
     if payload.interval_minutes is not None:
@@ -3026,6 +3550,54 @@ def requeue_search_task(task_id: str, session: Session = Depends(get_db)) -> dic
     session.commit()
     session.refresh(task)
     return {"task": to_search_task(task)}
+
+
+@app.delete("/api/search-tasks/{task_id}")
+def delete_search_task(task_id: str, session: Session = Depends(get_db)) -> dict:
+    task = session.get(SearchTask, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="关键词任务不存在")
+    session.delete(task)
+    write_audit_log(
+        session,
+        log_type="manual_action",
+        operator_type="web",
+        operator_id="web",
+        target_type="search_task",
+        target_id=task.id,
+        message="删除关键词采集任务",
+        payload={},
+    )
+    session.commit()
+    return {"deleted": True}
+
+
+@app.post("/api/search-tasks/{task_id}/run")
+def run_search_task_now(task_id: str, session: Session = Depends(get_db)) -> dict:
+    task = session.get(SearchTask, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="关键词任务不存在")
+    if not task.enabled:
+        raise HTTPException(status_code=409, detail="关键词任务已停用")
+    if task_has_active_execution(task):
+        raise HTTPException(status_code=409, detail="关键词任务正在执行，请稍后再试")
+    reset_task_to_pending(task)
+    write_audit_log(
+        session,
+        log_type="manual_action",
+        operator_type="web",
+        operator_id="web",
+        target_type="search_task",
+        target_id=task.id,
+        message="手动立即执行关键词采集任务",
+        payload={},
+    )
+    session.commit()
+    session.refresh(task)
+    run_search_task_once(session, task)
+    refreshed = session.get(SearchTask, task_id)
+    assert refreshed is not None
+    return {"task": to_search_task(refreshed)}
 
 
 @app.get("/api/app/search-tasks/next")
@@ -3154,7 +3726,14 @@ def list_search_results(task_id: str | None = Query(default=None), session: Sess
     stmt = select(SearchResult).order_by(SearchResult.created_at.desc())
     if task_id:
         stmt = stmt.where(SearchResult.search_task_id == task_id)
-    return {"results": [to_search_result_public(item) for item in session.execute(stmt).scalars().all()]}
+    seen_post_ids: set[str] = set()
+    results = []
+    for item in session.execute(stmt).scalars().all():
+        if item.post_id in seen_post_ids:
+            continue
+        seen_post_ids.add(item.post_id)
+        results.append(to_search_result_public(item))
+    return {"results": results}
 
 
 @app.patch("/api/search-results/{result_id}")
@@ -3190,7 +3769,7 @@ def create_analytics_task(payload: AnalyticsTaskCreate, session: Session = Depen
         account_id=payload.account_id,
         interval_minutes=payload.interval_minutes,
         enabled=payload.enabled,
-        group_name=payload.group_name.strip(),
+        group_name="",
         task_status="pending",
         max_retry=payload.max_retry,
     )
@@ -3203,7 +3782,7 @@ def create_analytics_task(payload: AnalyticsTaskCreate, session: Session = Depen
         target_type="analytics_task",
         target_id=task.id,
         message="创建账号监控任务",
-        payload={"group_name": task.group_name},
+        payload={},
     )
     session.commit()
     session.refresh(task)
@@ -3223,8 +3802,6 @@ def update_analytics_task(task_id: str, payload: AnalyticsTaskUpdate, session: S
         raise HTTPException(status_code=404, detail="账号监控任务不存在")
     if payload.enabled is not None:
         task.enabled = payload.enabled
-    if payload.group_name is not None:
-        task.group_name = payload.group_name.strip()
     if payload.interval_minutes is not None:
         task.interval_minutes = payload.interval_minutes
     write_audit_log(
@@ -3261,6 +3838,54 @@ def requeue_analytics_task(task_id: str, session: Session = Depends(get_db)) -> 
     session.commit()
     session.refresh(task)
     return {"task": to_analytics_task(task)}
+
+
+@app.delete("/api/analytics-tasks/{task_id}")
+def delete_analytics_task(task_id: str, session: Session = Depends(get_db)) -> dict:
+    task = session.get(AnalyticsTask, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="账号监控任务不存在")
+    session.delete(task)
+    write_audit_log(
+        session,
+        log_type="manual_action",
+        operator_type="web",
+        operator_id="web",
+        target_type="analytics_task",
+        target_id=task.id,
+        message="删除账号监控任务",
+        payload={},
+    )
+    session.commit()
+    return {"deleted": True}
+
+
+@app.post("/api/analytics-tasks/{task_id}/run")
+def run_analytics_task_now(task_id: str, session: Session = Depends(get_db)) -> dict:
+    task = session.get(AnalyticsTask, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="账号监控任务不存在")
+    if not task.enabled:
+        raise HTTPException(status_code=409, detail="账号监控任务已停用")
+    if task_has_active_execution(task):
+        raise HTTPException(status_code=409, detail="账号监控任务正在执行，请稍后再试")
+    reset_task_to_pending(task)
+    write_audit_log(
+        session,
+        log_type="manual_action",
+        operator_type="web",
+        operator_id="web",
+        target_type="analytics_task",
+        target_id=task.id,
+        message="手动立即执行账号监控任务",
+        payload={},
+    )
+    session.commit()
+    session.refresh(task)
+    run_analytics_task_once(session, task)
+    refreshed = session.get(AnalyticsTask, task_id)
+    assert refreshed is not None
+    return {"task": to_analytics_task(refreshed)}
 
 
 @app.get("/api/app/analytics-tasks/next")
@@ -3402,23 +4027,6 @@ def app_next_task(
         session.commit()
         return {"task_type": "publish", "task": to_publish_task(task)}
 
-    claimed_search = claim_search_task(session, device_id)
-    if claimed_search:
-        task, worker = claimed_search
-        body = to_search_task(task)
-        if worker:
-            body["worker_cookie_id"] = worker.id
-        session.commit()
-        return {"task_type": "search", "task": body}
-
-    claimed_analytics = claim_analytics_task(session, device_id)
-    if claimed_analytics:
-        task, worker = claimed_analytics
-        body = to_analytics_task(task)
-        body["worker_cookie_id"] = worker.id
-        session.commit()
-        return {"task_type": "analytics", "task": body}
-
     session.commit()
     return {"task_type": None, "task": None}
 
@@ -3493,6 +4101,11 @@ def ops_summary(session: Session = Depends(get_db)) -> dict:
         ],
     }
     return {"summary": summary}
+
+
+@app.post("/api/ops/run-due-tasks")
+def ops_run_due_tasks() -> dict:
+    return {"result": run_backend_task_cycle_once()}
 
 
 if FRONTEND_DIST.exists():

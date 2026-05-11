@@ -23,10 +23,10 @@ type Account = {
   nickname: string;
   cookie_preview: string;
   status: string;
-  group_name: string;
   remark: string;
   bound_device_id: string;
-  usage_tags: string[];
+  is_busy?: boolean;
+  runtime_state?: string;
   last_check_at?: string | null;
   cooldown_until?: string | null;
   failure_count: number;
@@ -49,6 +49,11 @@ type PublishTask = {
   last_error: string;
 };
 
+type PublishStatusMeta = {
+  label: string;
+  tone: string;
+};
+
 type SearchTask = {
   id: string;
   keyword: string;
@@ -68,6 +73,15 @@ type SearchResult = {
   post_url: string;
   title: string;
   content_preview: string;
+  content: string;
+  note_type: string;
+  topics: string[];
+  image_urls: string[];
+  video_url: string;
+  video_cover_url: string;
+  author_avatar: string;
+  cover_url: string;
+  location: string;
   author_name: string;
   like_count: number;
   comment_count: number;
@@ -195,6 +209,26 @@ function Card({ title, children }: { title: string; children: React.ReactNode })
   );
 }
 
+function formatTime(value?: string | null) {
+  return value ? new Date(value).toLocaleString() : "无";
+}
+
+function getPublishStatusMeta(taskStatus: string): PublishStatusMeta {
+  if (taskStatus === "success") {
+    return { label: "发布成功", tone: "bg-emerald-50 text-emerald-700 ring-emerald-100" };
+  }
+  if (taskStatus === "failed" || taskStatus === "cancelled") {
+    return { label: "发布失败", tone: "bg-rose-50 text-rose-700 ring-rose-100" };
+  }
+  return { label: "待发布", tone: "bg-amber-50 text-amber-700 ring-amber-100" };
+}
+
+function toMediaProxyUrl(url?: string | null) {
+  const candidate = (url || "").trim();
+  if (!candidate) return "";
+  return `/api/media-proxy?url=${encodeURIComponent(candidate)}`;
+}
+
 function App() {
   const [tab, setTab] = useState<TabKey>("dashboard");
   const [message, setMessage] = useState("");
@@ -208,14 +242,10 @@ function App() {
   const [analyticsSnapshots, setAnalyticsSnapshots] = useState<AnalyticsSnapshot[]>([]);
   const [devices, setDevices] = useState<Device[]>([]);
   const [logs, setLogs] = useState<AuditLog[]>([]);
-
-  const [primaryForm, setPrimaryForm] = useState({ name: "", cookies: "", nickname: "", bound_device_id: "", remark: "" });
   const [workerForm, setWorkerForm] = useState({
     name: "",
     cookies: "",
     remark: "",
-    usage_tags: "worker_search",
-    group_name: "",
     phone: "",
     code: ""
   });
@@ -235,13 +265,11 @@ function App() {
   });
   const [searchForm, setSearchForm] = useState({
     keyword: "",
-    group_name: "",
     require_num: 10,
     interval_minutes: 120
   });
   const [analyticsForm, setAnalyticsForm] = useState({
     account_id: "",
-    group_name: "",
     interval_minutes: 360
   });
 
@@ -284,32 +312,16 @@ function App() {
     loadAll().catch((error: Error) => setMessage(error.message));
   }, []);
 
-  async function submitPrimary(event: FormEvent) {
-    event.preventDefault();
-    try {
-      await api("/api/accounts/primary", { method: "POST", body: JSON.stringify(primaryForm) });
-      setPrimaryForm({ name: "", cookies: "", nickname: "", bound_device_id: "", remark: "" });
-      setMessage("主账号已创建");
-      await loadAll();
-    } catch (error) {
-      setMessage((error as Error).message);
-    }
-  }
-
   async function submitWorker(event: FormEvent) {
     event.preventDefault();
     try {
       await api("/api/cookie-workers", {
         method: "POST",
         body: JSON.stringify({
-          ...workerForm,
-          usage_tags: workerForm.usage_tags
-            .split(",")
-            .map((item) => item.trim())
-            .filter(Boolean)
+          ...workerForm
         })
       });
-      setWorkerForm({ name: "", cookies: "", remark: "", usage_tags: "worker_search", group_name: "", phone: "", code: "" });
+      setWorkerForm({ name: "", cookies: "", remark: "", phone: "", code: "" });
       setWorkerSmsSession(null);
       setWorkerQrSession(null);
       setMessage("小号 Cookie 已创建");
@@ -323,11 +335,8 @@ function App() {
     return {
       name: workerForm.name,
       remark: workerForm.remark,
-      group_name: workerForm.group_name,
-      usage_tags: workerForm.usage_tags
-        .split(",")
-        .map((item) => item.trim())
-        .filter(Boolean)
+      group_name: "",
+      usage_tags: []
     };
   }
 
@@ -364,7 +373,7 @@ function App() {
           zone: "86"
         })
       });
-      setWorkerForm({ name: "", cookies: "", remark: "", usage_tags: "worker_search", group_name: "", phone: "", code: "" });
+      setWorkerForm({ name: "", cookies: "", remark: "", phone: "", code: "" });
       setWorkerSmsSession(null);
       setWorkerQrSession(null);
       setMessage(response.message || "小号已创建");
@@ -404,7 +413,7 @@ function App() {
       });
       setMessage(response.message);
       if (response.success) {
-        setWorkerForm({ name: "", cookies: "", remark: "", usage_tags: "worker_search", group_name: "", phone: "", code: "" });
+        setWorkerForm({ name: "", cookies: "", remark: "", phone: "", code: "" });
         setWorkerQrSession(null);
         setWorkerSmsSession(null);
         await loadAll();
@@ -447,7 +456,7 @@ function App() {
     event.preventDefault();
     try {
       await api("/api/search-tasks", { method: "POST", body: JSON.stringify(searchForm) });
-      setSearchForm({ keyword: "", group_name: "", require_num: 10, interval_minutes: 120 });
+      setSearchForm({ keyword: "", require_num: 10, interval_minutes: 120 });
       setMessage("关键词任务已创建");
       await loadAll();
     } catch (error) {
@@ -459,34 +468,8 @@ function App() {
     event.preventDefault();
     try {
       await api("/api/analytics-tasks", { method: "POST", body: JSON.stringify(analyticsForm) });
-      setAnalyticsForm({ account_id: primaryAccounts[0]?.id || "", group_name: "", interval_minutes: 360 });
+      setAnalyticsForm({ account_id: primaryAccounts[0]?.id || "", interval_minutes: 360 });
       setMessage("账号监控任务已创建");
-      await loadAll();
-    } catch (error) {
-      setMessage((error as Error).message);
-    }
-  }
-
-  async function approvePublishTask(taskId: string, reviewStatus: "approved" | "rejected") {
-    try {
-      await api(`/api/publish-tasks/${taskId}`, {
-        method: "PATCH",
-        body: JSON.stringify({ review_status: reviewStatus })
-      });
-      setMessage(`发帖任务已${reviewStatus === "approved" ? "通过" : "拒绝"}`);
-      await loadAll();
-    } catch (error) {
-      setMessage((error as Error).message);
-    }
-  }
-
-  async function cancelPublishTask(taskId: string) {
-    try {
-      await api(`/api/publish-tasks/${taskId}`, {
-        method: "PATCH",
-        body: JSON.stringify({ task_status: "cancelled" })
-      });
-      setMessage("发帖任务已取消");
       await loadAll();
     } catch (error) {
       setMessage((error as Error).message);
@@ -506,29 +489,6 @@ function App() {
     } catch (error) {
       setMessage((error as Error).message);
     }
-  }
-
-  async function updateWorker(account: Account, status: "active" | "disabled") {
-    try {
-      await api(`/api/cookie-workers/${account.id}`, {
-        method: "PATCH",
-        body: JSON.stringify({
-          status,
-          group_name: account.group_name,
-          remark: account.remark,
-          usage_tags: account.usage_tags || []
-        })
-      });
-      setMessage(status === "active" ? "小号已启用" : "小号已停用");
-      await loadAll();
-    } catch (error) {
-      setMessage((error as Error).message);
-    }
-  }
-
-  async function toggleWorker(account: Account) {
-    const nextStatus = account.status === "disabled" ? "active" : "disabled";
-    await updateWorker(account, nextStatus);
   }
 
   async function toggleSearchTask(task: SearchTask) {
@@ -568,13 +528,30 @@ function App() {
     }
   }
 
-  async function updateDevice(device: Device, status: "online" | "disabled") {
+  async function deleteTask(taskType: "search" | "analytics", taskId: string) {
     try {
-      await api(`/api/devices/${device.id}`, {
-        method: "PATCH",
-        body: JSON.stringify({ status })
-      });
-      setMessage(status === "online" ? "设备已启用" : "设备已禁用");
+      await api(taskType === "search" ? `/api/search-tasks/${taskId}` : `/api/analytics-tasks/${taskId}`, { method: "DELETE" });
+      setMessage(taskType === "search" ? "关键词任务已删除" : "账号监控任务已删除");
+      await loadAll();
+    } catch (error) {
+      setMessage((error as Error).message);
+    }
+  }
+
+  async function runSearchTaskNow(task: SearchTask) {
+    try {
+      await api(`/api/search-tasks/${task.id}/run`, { method: "POST" });
+      setMessage(`关键词任务“${task.keyword}”已立即执行`);
+      await loadAll();
+    } catch (error) {
+      setMessage((error as Error).message);
+    }
+  }
+
+  async function runAnalyticsTaskNow(task: AnalyticsTask) {
+    try {
+      await api(`/api/analytics-tasks/${task.id}/run`, { method: "POST" });
+      setMessage(`账号监控任务已立即执行`);
       await loadAll();
     } catch (error) {
       setMessage((error as Error).message);
@@ -609,6 +586,10 @@ function App() {
       setAnalyticsForm((current) => ({ ...current, account_id: primaryAccounts[0].id }));
     }
   }, [primaryAccounts, publishForm.account_id, analyticsForm.account_id]);
+
+  function getAccountName(accountId: string) {
+    return primaryAccounts.find((account) => account.id === accountId)?.name || "未匹配账号";
+  }
 
   return (
     <div className="min-h-screen bg-slate-100 text-slate-900">
@@ -674,16 +655,11 @@ function App() {
         )}
 
         {tab === "primary" && (
-          <div className="grid gap-6 lg:grid-cols-[360px,1fr]">
-            <Card title="新增主账号">
-              <form className="space-y-3" onSubmit={submitPrimary}>
-                <input className="w-full rounded-xl border px-3 py-2" placeholder="账号名称" value={primaryForm.name} onChange={(e) => setPrimaryForm({ ...primaryForm, name: e.target.value })} />
-                <input className="w-full rounded-xl border px-3 py-2" placeholder="昵称（可选）" value={primaryForm.nickname} onChange={(e) => setPrimaryForm({ ...primaryForm, nickname: e.target.value })} />
-                <input className="w-full rounded-xl border px-3 py-2" placeholder="绑定设备 ID（可选）" value={primaryForm.bound_device_id} onChange={(e) => setPrimaryForm({ ...primaryForm, bound_device_id: e.target.value })} />
-                <textarea className="h-32 w-full rounded-xl border px-3 py-2" placeholder="主 Cookie" value={primaryForm.cookies} onChange={(e) => setPrimaryForm({ ...primaryForm, cookies: e.target.value })} />
-                <textarea className="h-20 w-full rounded-xl border px-3 py-2" placeholder="备注" value={primaryForm.remark} onChange={(e) => setPrimaryForm({ ...primaryForm, remark: e.target.value })} />
-                <button className="rounded-xl bg-slate-900 px-4 py-2 text-white" type="submit">保存主账号</button>
-              </form>
+          <div className="space-y-6">
+            <Card title="主账号说明">
+              <div className="rounded-2xl bg-slate-50 p-4 text-sm leading-6 text-slate-600">
+                Web 端只负责查看主账号状态和校验结果。主账号新增、登录和 Cookie 更新只在 Android 端处理。
+              </div>
             </Card>
             <Card title="主账号列表">
               <div className="space-y-4">
@@ -693,7 +669,8 @@ function App() {
                       <div>
                         <div className="font-semibold">{account.name}</div>
                         <div className="text-sm text-slate-500">{account.nickname || "无昵称"} · {account.cookie_preview}</div>
-                        <div className="mt-1 text-xs text-slate-500">状态 {account.status} · 绑定设备 {account.bound_device_id || "未绑定"}</div>
+                        <div className="mt-1 text-xs text-slate-500">状态 {account.status} · 绑定设备 {account.bound_device_id || "未绑定"} · 最近校验 {formatTime(account.last_check_at)}</div>
+                        {account.remark ? <div className="mt-2 text-xs text-slate-500">备注 {account.remark}</div> : null}
                       </div>
                       <button className="rounded-lg border px-3 py-1 text-sm" onClick={() => checkPrimary(account.id)}>校验</button>
                     </div>
@@ -727,8 +704,6 @@ function App() {
                   ))}
                 </div>
                 <input className="w-full rounded-xl border px-3 py-2" placeholder="账号名称" value={workerForm.name} onChange={(e) => setWorkerForm({ ...workerForm, name: e.target.value })} />
-                <input className="w-full rounded-xl border px-3 py-2" placeholder="分组，如 brand_a" value={workerForm.group_name} onChange={(e) => setWorkerForm({ ...workerForm, group_name: e.target.value })} />
-                <input className="w-full rounded-xl border px-3 py-2" placeholder="用途标签，逗号分隔" value={workerForm.usage_tags} onChange={(e) => setWorkerForm({ ...workerForm, usage_tags: e.target.value })} />
                 {workerAuthMode === "cookie" && (
                   <textarea className="h-32 w-full rounded-xl border px-3 py-2" placeholder="Worker Cookie" value={workerForm.cookies} onChange={(e) => setWorkerForm({ ...workerForm, cookies: e.target.value })} />
                 )}
@@ -775,15 +750,13 @@ function App() {
                         <div className="font-semibold">{account.name}</div>
                         <div className="text-sm text-slate-500">{account.cookie_preview}</div>
                         <div className="mt-1 text-xs text-slate-500">
-                          状态 {account.status} · 分组 {account.group_name || "未分组"} · 标签 {(account.usage_tags || []).join(", ") || "无"}
+                          状态 {account.status} · {account.runtime_state === "busy" ? "忙碌中" : "空闲"}
                         </div>
-                        <div className="mt-1 text-xs text-slate-500">失败次数 {account.failure_count}</div>
+                        <div className="mt-1 text-xs text-slate-500">失败次数 {account.failure_count} · 最近校验 {formatTime(account.last_check_at)} · 冷却到 {formatTime(account.cooldown_until)}</div>
+                        {account.remark ? <div className="mt-2 text-xs text-slate-500">备注 {account.remark}</div> : null}
                       </div>
                       <div className="flex flex-wrap gap-2">
                         <button className="rounded-lg border px-3 py-1 text-sm" type="button" onClick={() => checkWorker(account.id)}>校验</button>
-                        <button className="rounded-lg border px-3 py-1 text-sm" type="button" onClick={() => toggleWorker(account)}>
-                          {account.status === "disabled" ? "启用" : "停用"}
-                        </button>
                       </div>
                     </div>
                   </div>
@@ -810,33 +783,61 @@ function App() {
                 </select>
                 <textarea className="h-28 w-full rounded-xl border px-3 py-2" placeholder="媒体 URL，每行一个" value={publishForm.media_urls} onChange={(e) => setPublishForm({ ...publishForm, media_urls: e.target.value })} />
                 <input className="w-full rounded-xl border px-3 py-2" placeholder="封面 URL（视频可选）" value={publishForm.cover_url} onChange={(e) => setPublishForm({ ...publishForm, cover_url: e.target.value })} />
-                <select className="w-full rounded-xl border px-3 py-2" value={publishForm.review_status} onChange={(e) => setPublishForm({ ...publishForm, review_status: e.target.value })}>
-                  <option value="approved">approved</option>
-                  <option value="pending">pending</option>
-                </select>
                 <button className="rounded-xl bg-slate-900 px-4 py-2 text-white" type="submit">创建任务</button>
               </form>
             </Card>
             <Card title="发帖任务列表">
-              <div className="space-y-4">
+              <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
                 {publishTasks.map((task) => (
-                  <div key={task.id} className="rounded-2xl border border-slate-200 p-4">
-                    <div className="flex flex-wrap items-start justify-between gap-3">
-                      <div>
-                        <div className="font-semibold">{task.title}</div>
-                        <div className="text-sm text-slate-500">{task.media_type} · 审核 {task.review_status} · 状态 {task.task_status}</div>
-                        <div className="mt-1 text-xs text-slate-500">{task.media_urls.join(", ")}</div>
-                        <div className="mt-1 text-xs text-slate-500">领取设备 {task.claim_expires_at ? "执行中" : "无"} · 到期 {task.claim_expires_at ? new Date(task.claim_expires_at).toLocaleString() : "无"}</div>
-                        {task.last_error ? <div className="mt-2 text-xs text-rose-600">{task.last_error}</div> : null}
-                      </div>
-                      <div className="flex flex-wrap gap-2">
-                        <button className="rounded-lg border px-3 py-1 text-sm" onClick={() => approvePublishTask(task.id, "approved")}>通过</button>
-                        <button className="rounded-lg border px-3 py-1 text-sm" onClick={() => approvePublishTask(task.id, "rejected")}>拒绝</button>
-                        <button className="rounded-lg border px-3 py-1 text-sm" onClick={() => requeueTask("publish", task.id)}>重入队</button>
-                        <button className="rounded-lg border px-3 py-1 text-sm" onClick={() => cancelPublishTask(task.id)}>取消</button>
+                  <article key={task.id} className="overflow-hidden rounded-[28px] border border-slate-200 bg-white shadow-sm">
+                    <div className="relative aspect-[3/4] overflow-hidden bg-slate-100">
+                      {toMediaProxyUrl(task.cover_url || task.media_urls[0]) ? (
+                        <img
+                          src={toMediaProxyUrl(task.cover_url || task.media_urls[0])}
+                          alt={task.title}
+                          className="h-full w-full object-cover"
+                        />
+                      ) : (
+                        <div className="flex h-full items-center justify-center bg-[linear-gradient(180deg,#f8fafc_0%,#e2e8f0_100%)] text-sm font-medium text-slate-400">
+                          暂无封面
+                        </div>
+                      )}
+                      <div className="absolute inset-x-0 top-0 flex items-center justify-between p-3">
+                        <span className={`rounded-full px-3 py-1 text-xs font-semibold ring-1 ${getPublishStatusMeta(task.task_status).tone}`}>
+                          {getPublishStatusMeta(task.task_status).label}
+                        </span>
+                        <span className="rounded-full bg-black/55 px-3 py-1 text-xs font-medium text-white">
+                          {task.media_type === "video" ? "视频" : `${task.media_urls.length || 0} 图`}
+                        </span>
                       </div>
                     </div>
-                  </div>
+                    <div className="space-y-3 p-4">
+                      <div className="space-y-2">
+                        <div className="line-clamp-2 text-base font-semibold leading-6 text-slate-900">{task.title}</div>
+                        {task.desc ? <div className="line-clamp-4 whitespace-pre-wrap text-sm leading-6 text-slate-600">{task.desc}</div> : null}
+                        {task.topics.length ? (
+                          <div className="flex flex-wrap gap-2">
+                            {task.topics.map((topic) => (
+                              <span key={topic} className="rounded-full bg-rose-50 px-2.5 py-1 text-xs font-semibold text-rose-600">
+                                #{topic}
+                              </span>
+                            ))}
+                          </div>
+                        ) : null}
+                      </div>
+                      <div className="space-y-1 text-xs text-slate-500">
+                        <div>主账号 {getAccountName(task.account_id)}</div>
+                        <div>位置 {task.location || "未填写"} · 计划时间 {formatTime(task.scheduled_at)}</div>
+                        <div>执行状态 {task.claim_expires_at ? `执行中，领取到 ${formatTime(task.claim_expires_at)}` : "未领取"}</div>
+                      </div>
+                      {task.last_error ? <div className="rounded-2xl bg-rose-50 px-3 py-2 text-xs leading-5 text-rose-700">{task.last_error}</div> : null}
+                      <div className="flex flex-wrap gap-2">
+                        {task.task_status === "failed" ? (
+                          <button className="rounded-lg border px-3 py-1 text-sm" onClick={() => requeueTask("publish", task.id)}>重新发布</button>
+                        ) : null}
+                      </div>
+                    </div>
+                  </article>
                 ))}
               </div>
             </Card>
@@ -848,7 +849,6 @@ function App() {
             <Card title="创建关键词任务">
               <form className="space-y-3" onSubmit={submitSearchTask}>
                 <input className="w-full rounded-xl border px-3 py-2" placeholder="关键词" value={searchForm.keyword} onChange={(e) => setSearchForm({ ...searchForm, keyword: e.target.value })} />
-                <input className="w-full rounded-xl border px-3 py-2" placeholder="分组" value={searchForm.group_name} onChange={(e) => setSearchForm({ ...searchForm, group_name: e.target.value })} />
                 <input className="w-full rounded-xl border px-3 py-2" type="number" placeholder="单次数量" value={searchForm.require_num} onChange={(e) => setSearchForm({ ...searchForm, require_num: Number(e.target.value) })} />
                 <input className="w-full rounded-xl border px-3 py-2" type="number" placeholder="间隔分钟" value={searchForm.interval_minutes} onChange={(e) => setSearchForm({ ...searchForm, interval_minutes: Number(e.target.value) })} />
                 <button className="rounded-xl bg-slate-900 px-4 py-2 text-white" type="submit">创建任务</button>
@@ -861,7 +861,7 @@ function App() {
                     <div className="flex flex-wrap items-start justify-between gap-3">
                       <div>
                         <div className="font-semibold">{task.keyword}</div>
-                        <div className="text-sm text-slate-500">分组 {task.group_name || "未分组"} · 数量 {task.require_num} · 间隔 {task.interval_minutes} 分钟</div>
+                        <div className="text-sm text-slate-500">数量 {task.require_num} · 间隔 {task.interval_minutes} 分钟</div>
                         <div className="mt-1 text-xs text-slate-500">状态 {task.task_status} · {task.enabled ? "启用" : "停用"}</div>
                         <div className="mt-1 text-xs text-slate-500">最近执行 {task.last_run_at ? new Date(task.last_run_at).toLocaleString() : "无"}</div>
                         {task.last_error ? <div className="mt-2 text-xs text-rose-600">{task.last_error}</div> : null}
@@ -870,7 +870,8 @@ function App() {
                         <button className="rounded-lg border px-3 py-1 text-sm" onClick={() => toggleSearchTask(task)}>
                           {task.enabled ? "停用" : "启用"}
                         </button>
-                        <button className="rounded-lg border px-3 py-1 text-sm" onClick={() => requeueTask("search", task.id)}>重入队</button>
+                        <button className="rounded-lg border px-3 py-1 text-sm" onClick={() => runSearchTaskNow(task)}>立即执行</button>
+                        <button className="rounded-lg border px-3 py-1 text-sm text-rose-600" onClick={() => deleteTask("search", task.id)}>删除任务</button>
                       </div>
                     </div>
                   </div>
@@ -882,17 +883,52 @@ function App() {
 
         {tab === "results" && (
           <Card title="采集结果">
-            <div className="space-y-4">
+            <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
               {searchResults.map((item) => (
-                <div key={item.id} className="rounded-2xl border border-slate-200 p-4">
-                  <div className="flex flex-wrap items-start justify-between gap-3">
-                    <div>
-                      <div className="font-semibold">{item.title || item.post_id}</div>
-                      <div className="mt-1 text-sm text-slate-600">{item.content_preview}</div>
-                      <div className="mt-2 text-xs text-slate-500">
-                        {item.author_name || "未知作者"} · 点赞 {item.like_count} · 评论 {item.comment_count} · 收藏 {item.collect_count}
+                <article key={item.id} className="overflow-hidden rounded-[28px] border border-slate-200 bg-white shadow-sm">
+                  <div className="relative aspect-[3/4] overflow-hidden bg-slate-100">
+                    {toMediaProxyUrl(item.cover_url || item.video_cover_url || item.image_urls[0]) ? (
+                      <img
+                        src={toMediaProxyUrl(item.cover_url || item.video_cover_url || item.image_urls[0])}
+                        alt={item.title || item.post_id}
+                        className="h-full w-full object-cover"
+                      />
+                    ) : (
+                      <div className="flex h-full items-center justify-center bg-[linear-gradient(180deg,#f8fafc_0%,#e2e8f0_100%)] text-sm font-medium text-slate-400">
+                        暂无封面
                       </div>
-                      <div className="mt-1 text-xs text-slate-500">审核 {item.review_status} · {item.hidden ? "已隐藏" : "展示中"}</div>
+                    )}
+                    <div className="absolute inset-x-0 top-0 flex items-center justify-between p-3">
+                      <span className={`rounded-full px-3 py-1 text-xs font-semibold ring-1 ${
+                        item.hidden ? "bg-slate-100 text-slate-600 ring-slate-200" :
+                        item.review_status === "valid" ? "bg-emerald-50 text-emerald-700 ring-emerald-100" :
+                        item.review_status === "rejected" ? "bg-rose-50 text-rose-700 ring-rose-100" :
+                        "bg-amber-50 text-amber-700 ring-amber-100"
+                      }`}>
+                        {item.hidden ? "已隐藏" : item.review_status === "valid" ? "有效" : item.review_status === "rejected" ? "无效" : "待处理"}
+                      </span>
+                      <span className="rounded-full bg-black/55 px-3 py-1 text-xs font-medium text-white">
+                        {item.video_url ? "视频" : `${item.image_urls.length || 0} 图`}
+                      </span>
+                    </div>
+                  </div>
+                  <div className="space-y-3 p-4">
+                    <div className="space-y-2">
+                      <div className="line-clamp-2 text-base font-semibold leading-6 text-slate-900">{item.title || item.post_id}</div>
+                      {(item.content || item.content_preview) ? <div className="line-clamp-4 whitespace-pre-wrap text-sm leading-6 text-slate-600">{item.content || item.content_preview}</div> : null}
+                      {item.topics.length ? (
+                        <div className="flex flex-wrap gap-2">
+                          {item.topics.map((topic) => (
+                            <span key={topic} className="rounded-full bg-rose-50 px-2.5 py-1 text-xs font-semibold text-rose-600">
+                              #{topic}
+                            </span>
+                          ))}
+                        </div>
+                      ) : null}
+                    </div>
+                    <div className="space-y-1 text-xs text-slate-500">
+                      <div>{item.author_name || "未知作者"} · 点赞 {item.like_count} · 评论 {item.comment_count} · 收藏 {item.collect_count}</div>
+                      <div>位置 {item.location || "未填写"} · 采集时间 {formatTime(item.created_at)}</div>
                     </div>
                     <div className="flex flex-wrap gap-2">
                       <button className="rounded-lg border px-3 py-1 text-sm" onClick={() => updateSearchResult(item, { review_status: "valid" })}>有效</button>
@@ -902,7 +938,7 @@ function App() {
                       </button>
                     </div>
                   </div>
-                </div>
+                </article>
               ))}
             </div>
           </Card>
@@ -915,7 +951,6 @@ function App() {
                 <select className="w-full rounded-xl border px-3 py-2" value={analyticsForm.account_id} onChange={(e) => setAnalyticsForm({ ...analyticsForm, account_id: e.target.value })}>
                   {primaryAccounts.map((account) => <option key={account.id} value={account.id}>{account.name}</option>)}
                 </select>
-                <input className="w-full rounded-xl border px-3 py-2" placeholder="分组" value={analyticsForm.group_name} onChange={(e) => setAnalyticsForm({ ...analyticsForm, group_name: e.target.value })} />
                 <input className="w-full rounded-xl border px-3 py-2" type="number" value={analyticsForm.interval_minutes} onChange={(e) => setAnalyticsForm({ ...analyticsForm, interval_minutes: Number(e.target.value) })} />
                 <button className="rounded-xl bg-slate-900 px-4 py-2 text-white" type="submit">创建任务</button>
               </form>
@@ -928,7 +963,7 @@ function App() {
                       <div className="flex flex-wrap items-start justify-between gap-3">
                         <div>
                           <div className="font-semibold">{task.account_id}</div>
-                          <div className="text-sm text-slate-500">分组 {task.group_name || "未分组"} · 间隔 {task.interval_minutes} 分钟</div>
+                          <div className="text-sm text-slate-500">间隔 {task.interval_minutes} 分钟</div>
                           <div className="mt-1 text-xs text-slate-500">状态 {task.task_status} · {task.enabled ? "启用" : "停用"}</div>
                           <div className="mt-1 text-xs text-slate-500">最近执行 {task.last_run_at ? new Date(task.last_run_at).toLocaleString() : "无"}</div>
                           {task.last_error ? <div className="mt-2 text-xs text-rose-600">{task.last_error}</div> : null}
@@ -937,7 +972,8 @@ function App() {
                           <button className="rounded-lg border px-3 py-1 text-sm" onClick={() => toggleAnalyticsTask(task)}>
                             {task.enabled ? "停用" : "启用"}
                           </button>
-                          <button className="rounded-lg border px-3 py-1 text-sm" onClick={() => requeueTask("analytics", task.id)}>重入队</button>
+                          <button className="rounded-lg border px-3 py-1 text-sm" onClick={() => runAnalyticsTaskNow(task)}>立即执行</button>
+                          <button className="rounded-lg border px-3 py-1 text-sm text-rose-600" onClick={() => deleteTask("analytics", task.id)}>删除任务</button>
                         </div>
                       </div>
                     </div>
@@ -975,10 +1011,6 @@ function App() {
                       <div className="font-semibold">{device.device_name || device.device_id}</div>
                       <div className="mt-1 text-sm text-slate-500">{device.device_id} · {device.app_instance_id}</div>
                       <div className="mt-1 text-xs text-slate-500">状态 {device.status} · 版本 {device.app_version} · 最近心跳 {device.last_heartbeat_at ? new Date(device.last_heartbeat_at).toLocaleString() : "无"}</div>
-                    </div>
-                    <div className="flex flex-wrap gap-2">
-                      <button className="rounded-lg border px-3 py-1 text-sm" onClick={() => updateDevice(device, "online")}>启用</button>
-                      <button className="rounded-lg border px-3 py-1 text-sm" onClick={() => updateDevice(device, "disabled")}>禁用</button>
                     </div>
                   </div>
                 </div>
